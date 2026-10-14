@@ -1,16 +1,14 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { 
-  collection, 
-  getDocs, 
-  doc, 
+  collection,
+  getDocsFromServer,
+  getDocFromServer,
+  doc,
   query,
   where,
-  orderBy,
-  limit,
   onSnapshot,
-  runTransaction,
-  Timestamp
+  runTransaction
 } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { db, auth } from '../lib/firebase';
@@ -157,7 +155,7 @@ const describeFirestoreError = (error: any, what: string): string => {
   if (code === 'unavailable' || code === 'deadline-exceeded' || code === 'cancelled' || code === 'network-request-failed') {
     return `Network problem: could not complete ${what}. Check your connection and retry.`;
   }
-  if (code === 'failed-precondition') return `Could not complete ${what}. Check the Firestore index/configuration and try again.`;
+  if (code === 'failed-precondition') return `Firestore rejected ${what}. Inspect the full console error; if it explicitly requests an index, deploy that index and retry.`;
   return `Could not complete ${what}${code ? ` (${code})` : ''}.`;
 };
 
@@ -398,6 +396,11 @@ export default function Attendance() {
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [authResolved, setAuthResolved] = useState(false);
   const [attendanceStatus, setAttendanceStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [attendanceError, setAttendanceError] = useState('');
+  const [attendanceRetryNonce, setAttendanceRetryNonce] = useState(0);
+  const reportedCurrentErrorRef = useRef<string>('');
+  const reportedHistoryErrorRef = useRef<string>('');
+  const lastErrorToastRef = useRef<{ message: string; at: number } | null>(null);
   const reportedIssuesRef = useRef<string>('');
   const [isDark, setIsDark] = useState(false);
   const [activeTab, setActiveTab] = useState('attendance');
@@ -436,10 +439,20 @@ export default function Attendance() {
 
   // Skipped Dates Modal States
   const [lastSavedDate, setLastSavedDate] = useState<string | null>(null);
+  const [historyStatus, setHistoryStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [historyError, setHistoryError] = useState('');
+  const [historyCheckedScope, setHistoryCheckedScope] = useState('');
+  const [historyRetryNonce, setHistoryRetryNonce] = useState(0);
   const [skippedDates, setSkippedDates] = useState<string[]>([]);
   const [holidaySelections, setHolidaySelections] = useState<Record<string, boolean>>({});
   const [showSkipModal, setShowSkipModal] = useState<boolean>(false);
   const [isSavingSkipped, setIsSavingSkipped] = useState<boolean>(false);
+
+  // The result is valid only for this exact tenant/class/date/auth scope.
+  // This closes the render-to-effect window when a class or date changes.
+  const historyScopeKey = JSON.stringify([tenantId, authUserUid, selectedClassId, selectedDate]);
+  const isHistoryReadyForCurrentScope = historyStatus === 'ready' && historyCheckedScope === historyScopeKey;
+  const isHistoryErrorForCurrentScope = historyStatus === 'error' && historyCheckedScope === historyScopeKey;
 
   // 1. LISTEN TO FIREBASE AUTH & RESOLVE THE TENANT (single source of truth: the signed-in user)
   useEffect(() => {
@@ -453,6 +466,9 @@ export default function Attendance() {
       setYesterdayAttendanceMap({});
       setIsAlreadySaved(false);
       setLastSavedDate(null);
+      setHistoryStatus('loading');
+      setHistoryError('');
+      setHistoryCheckedScope('');
       setAuthResolved(true);
       setIsLoadingClasses(false);
       setAttendanceStatus('error');
@@ -477,6 +493,9 @@ export default function Attendance() {
         setYesterdayAttendanceMap({});
         setIsAlreadySaved(false);
         setLastSavedDate(null);
+        setHistoryStatus('loading');
+        setHistoryError('');
+        setHistoryCheckedScope('');
         setSkippedDates([]);
         setHolidaySelections({});
         setIsReadyToSave(false);
@@ -613,39 +632,52 @@ export default function Attendance() {
   const [attendanceMap, setAttendanceMap] = useState<Record<string | number, boolean>>({});
   const [yesterdayAttendanceMap, setYesterdayAttendanceMap] = useState<Record<string | number, boolean>>({});
 
-  // 3. FETCH ATTENDANCE RECORD IN REAL-TIME FROM FIREBASE
-  // Existing email-keyed path: users/{normalizedTeacherEmail}/attendance/{classId}_{YYYY-MM-DD}
+  // 3. FETCH THE CURRENT REGISTER AND YESTERDAY'S METRIC.
+  // Cache snapshots are never authoritative for the current-date existence check.
+  // A direct getDocFromServer read makes genuine network/permission failures observable,
+  // while includeMetadataChanges lets the listener report the cache -> server transition.
   useEffect(() => {
-    // Never keep data that belongs to a previous class, date, or tenant.
     setAttendanceMap({});
     setYesterdayAttendanceMap({});
     setIsAlreadySaved(false);
-    setLastSavedDate(null);
     setSkippedDates([]);
     setHolidaySelections({});
     setIsReadyToSave(false);
+    setAttendanceError('');
     setAttendanceStatus('loading');
+    reportedCurrentErrorRef.current = '';
 
     if (!db) {
+      const message = 'Firebase DB is not initialized. Check the Firebase configuration.';
       setAttendanceStatus('error');
+      setAttendanceError(message);
       return;
     }
     if (!authResolved || !tenantId || !authUserUid || !selectedClassId || !selectedDate) {
-      if (authResolved && (!tenantId || !authUserUid)) setAttendanceStatus('error');
-      else if (authResolved && tenantId && authUserUid && !selectedClassId && !isLoadingClasses) setAttendanceStatus('ready');
+      if (authResolved && (!tenantId || !authUserUid)) {
+        setAttendanceStatus('error');
+        setAttendanceError('You are signed out or your account has no email. Sign in again to access attendance.');
+      } else if (authResolved && tenantId && authUserUid && !selectedClassId && !isLoadingClasses) {
+        setAttendanceStatus('ready');
+      }
       return;
     }
     if (!isValidDateStr(selectedDate)) {
+      const message = 'Selected date is invalid. Please choose a valid calendar date.';
       setAttendanceStatus('error');
-      triggerErrorToast('Selected date is invalid. Please choose a valid calendar date.');
+      setAttendanceError(message);
+      triggerErrorToast(message);
       return;
     }
     if (!isSameTenantUser(auth?.currentUser, authUserUid, tenantId)) {
+      const message = 'Your login session changed. Please sign in again before accessing attendance.';
       setAttendanceStatus('error');
+      setAttendanceError(message);
       return;
     }
 
     let cancelled = false;
+    let serverConfirmed = false;
     const subscribedUid = authUserUid;
     const yesterdayStr = shiftDateStr(selectedDate, -1);
     const attendancePath = ['users', tenantId, 'attendance'] as const;
@@ -655,43 +687,104 @@ export default function Attendance() {
       isSameTenantUser(auth?.currentUser, subscribedUid, tenantId) &&
       authContextRef.current.uid === subscribedUid && authContextRef.current.tenantId === tenantId;
 
+    const applyServerConfirmedSnapshot = (todaySnap: any) => {
+      if (!isActiveScope()) return;
+      serverConfirmed = true;
+
+      if (!todaySnap.exists()) {
+        // Only a server-confirmed missing document creates a new editable register.
+        setAttendanceError('');
+        reportedCurrentErrorRef.current = '';
+        setAttendanceMap({});
+        setIsAlreadySaved(false);
+        setAttendanceStatus('ready');
+        return;
+      }
+
+      const validation = validateAttendanceRecord(todaySnap.data(), selectedClassId, selectedDate);
+      if (!validation.ok) {
+        const message = `Existing attendance record is malformed (${validation.issue}). It was not changed.`;
+        console.error(
+          `[Attendance] Malformed record at users/${tenantId}/attendance/${selectedClassId}_${selectedDate}: ${validation.issue}`,
+          { classId: selectedClassId, date: selectedDate, tenantId, documentData: todaySnap.data() }
+        );
+        setAttendanceMap({});
+        setIsAlreadySaved(true); // Existing malformed records are locked, never treated as new.
+        setAttendanceStatus('error');
+        setAttendanceError(message);
+        if (reportedCurrentErrorRef.current !== message) {
+          reportedCurrentErrorRef.current = message;
+          triggerErrorToast(message);
+        }
+        return;
+      }
+
+      setAttendanceError('');
+      reportedCurrentErrorRef.current = '';
+      setAttendanceMap(validation.attendanceMap);
+      setIsAlreadySaved(true);
+      setAttendanceStatus('ready');
+    };
+
     const unsubToday = onSnapshot(
       todayRef,
+      { includeMetadataChanges: true },
       (todaySnap) => {
         if (!isActiveScope()) return;
-        if (todaySnap.metadata.fromCache && !todaySnap.exists()) {
-          // A cached non-existence is not proof that the server has no record; never risk a duplicate save.
-          setAttendanceStatus('error');
-          triggerErrorToast('Cannot confirm this date is unsaved while offline. Reconnect and retry.');
+        if (todaySnap.metadata.fromCache || todaySnap.metadata.hasPendingWrites) {
+          // Cache snapshots and snapshots containing uncommitted local writes are inconclusive.
+          // Keep the page unconfirmed until a server-confirmed, committed snapshot resolves existence.
           return;
         }
-        if (!todaySnap.exists()) {
-          setAttendanceMap({});
-          setIsAlreadySaved(false);
-          setAttendanceStatus('ready');
-          return;
-        }
-
-        const validation = validateAttendanceRecord(todaySnap.data(), selectedClassId, selectedDate);
-        if (!validation.ok) {
-          console.error(`[Attendance] Malformed record at users/${tenantId}/attendance/${selectedClassId}_${selectedDate}: ${validation.issue}`);
-          setAttendanceMap({});
-          setIsAlreadySaved(true); // Keep malformed/existing data locked; never overwrite it from this UI.
-          setAttendanceStatus('error');
-          triggerErrorToast(`Existing attendance record is malformed (${validation.issue}). It was not changed.`);
-          return;
-        }
-        setAttendanceMap(validation.attendanceMap);
-        setIsAlreadySaved(true);
-        setAttendanceStatus('ready');
+        applyServerConfirmedSnapshot(todaySnap);
       },
       (error) => {
         if (!isActiveScope()) return;
-        console.error(`[Attendance] Attendance listener failed for users/${tenantId}/attendance/${selectedClassId}_${selectedDate}:`, error);
+        console.error(
+          `[Attendance] Current-date listener failed for users/${tenantId}/attendance/${selectedClassId}_${selectedDate}:`,
+          {
+            code: error?.code,
+            name: error?.name,
+            message: error?.message,
+            customData: error?.customData,
+            error
+          }
+        );
+        const message = describeFirestoreError(error, 'attendance for the selected date');
         setAttendanceStatus('error');
-        triggerErrorToast(describeFirestoreError(error, 'attendance'));
+        setAttendanceError(message);
+        if (reportedCurrentErrorRef.current !== message) {
+          reportedCurrentErrorRef.current = message;
+          triggerErrorToast(message);
+        }
       }
     );
+
+    // A server-only read guarantees that a cached empty result cannot enable editing or saving.
+    void getDocFromServer(todayRef).then((serverSnap) => {
+      if (!isActiveScope()) return;
+      if (serverSnap.metadata.fromCache || serverSnap.metadata.hasPendingWrites) return;
+      applyServerConfirmedSnapshot(serverSnap);
+    }).catch((error: any) => {
+      if (!isActiveScope() || serverConfirmed) return;
+      console.error(
+        `[Attendance] Server confirmation failed for users/${tenantId}/attendance/${selectedClassId}_${selectedDate}:`,
+        {
+          code: error?.code,
+          name: error?.name,
+          message: error?.message,
+          customData: error?.customData,
+          error
+        }
+      );
+      const message = describeFirestoreError(error, 'server confirmation of the selected attendance date');
+      setAttendanceStatus('error');
+      setAttendanceError(message);
+      if (reportedCurrentErrorRef.current !== message) {
+        reportedCurrentErrorRef.current = message;
+        triggerErrorToast(message);
+      }
+    });
 
     // Yesterday's record is read only for the existing absent-yesterday metric.
     const ydayRef = doc(db, ...attendancePath, `${selectedClassId}_${yesterdayStr}`);
@@ -722,39 +815,133 @@ export default function Attendance() {
       }
     );
 
-    // Query only this teacher's attendance and this class. Query both canonical date strings
-    // and legacy Firestore Timestamp dates; normalize and compare calendar dates locally.
-    const fetchLastSavedDate = async () => {
-      try {
-        const attCol = collection(db, ...attendancePath);
-        const localMidnight = new Date(
-          Number(selectedDate.slice(0, 4)), Number(selectedDate.slice(5, 7)) - 1, Number(selectedDate.slice(8, 10))
-        );
-        const [stringSnap, timestampSnap] = await Promise.all([
-          getDocs(query(attCol, where('classId', '==', selectedClassId), where('date', '<', selectedDate), orderBy('date', 'desc'), limit(1))),
-          getDocs(query(attCol, where('classId', '==', selectedClassId), where('date', '<', Timestamp.fromDate(localMidnight)), orderBy('date', 'desc'), limit(1)))
-        ]);
-        if (!isActiveScope()) return;
-        const candidateDates = [...stringSnap.docs, ...timestampSnap.docs]
-          .map((savedDoc) => normalizeStoredDate(savedDoc.data()?.date))
-          .filter((date): date is string => Boolean(date && date < selectedDate))
-          .sort((a, b) => b.localeCompare(a));
-        setLastSavedDate(candidateDates[0] ?? null);
-      } catch (e) {
-        if (!isActiveScope()) return;
-        console.error('[Attendance] Could not query the last saved date. A Firestore index may be required:', e);
-        setLastSavedDate(null);
-        triggerErrorToast(describeFirestoreError(e, 'the previous attendance date'));
-      }
-    };
-
-    void fetchLastSavedDate();
     return () => {
       cancelled = true;
       unsubToday();
       unsubYday();
     };
-  }, [authResolved, tenantId, authUserUid, selectedClassId, selectedDate, isLoadingClasses]);
+  }, [authResolved, tenantId, authUserUid, selectedClassId, selectedDate, isLoadingClasses, attendanceRetryNonce]);
+
+  // 4. VERIFY HISTORICAL ATTENDANCE INDEPENDENTLY FROM THE EDITABLE CURRENT REGISTER.
+  // Query just classId (the default single-field index) and normalize both legacy string
+  // dates and Timestamp dates locally. This avoids the compound classId/date range index
+  // and cannot silently ignore one format if a second query fails.
+  useEffect(() => {
+    let cancelled = false;
+    const checkedScope = JSON.stringify([tenantId, authUserUid, selectedClassId, selectedDate]);
+    setHistoryStatus('loading');
+    setHistoryError('');
+    setHistoryCheckedScope('');
+    setLastSavedDate(null);
+    reportedHistoryErrorRef.current = '';
+
+    const isActiveHistoryScope = () => !cancelled &&
+      isSameTenantUser(auth?.currentUser, authUserUid, tenantId) &&
+      authContextRef.current.uid === authUserUid && authContextRef.current.tenantId === tenantId;
+
+    const failHistoryLookup = (message: string, error?: any) => {
+      if (cancelled) return;
+      if (error) {
+        console.error('[Attendance] Historical attendance verification failed:', {
+          tenantId,
+          classId: selectedClassId,
+          selectedDate,
+          code: error?.code,
+          name: error?.name,
+          message: error?.message,
+          customData: error?.customData,
+          error
+        });
+      }
+      setLastSavedDate(null);
+      setHistoryStatus('error');
+      setHistoryError(message);
+      setHistoryCheckedScope(checkedScope);
+      if (reportedHistoryErrorRef.current !== message) {
+        reportedHistoryErrorRef.current = message;
+        triggerErrorToast(message);
+      }
+    };
+
+    if (!db) {
+      failHistoryLookup('Firebase DB is not initialized. Historical attendance cannot be verified.');
+      return () => { cancelled = true; };
+    }
+    if (!authResolved || !tenantId || !authUserUid || !selectedDate) {
+      return () => { cancelled = true; };
+    }
+    if (!selectedClassId) {
+      if (!isLoadingClasses) {
+        setLastSavedDate(null);
+        setHistoryStatus('ready');
+        setHistoryCheckedScope(checkedScope);
+      }
+      return () => { cancelled = true; };
+    }
+    if (!isValidDateStr(selectedDate)) {
+      failHistoryLookup('Selected date is invalid. Historical attendance cannot be verified.');
+      return () => { cancelled = true; };
+    }
+    if (!isActiveHistoryScope()) {
+      failHistoryLookup('Your login session changed. Sign in again before verifying historical attendance.');
+      return () => { cancelled = true; };
+    }
+
+    const runHistoricalLookup = async () => {
+      try {
+        const attendanceCollection = collection(db, 'users', tenantId, 'attendance');
+        const attendanceQuery = query(
+          attendanceCollection,
+          where('classId', '==', selectedClassId)
+        );
+        const snapshot = await getDocsFromServer(attendanceQuery);
+        if (!isActiveHistoryScope()) return;
+
+        const candidateDates: string[] = [];
+        for (const savedDoc of snapshot.docs) {
+          const data = savedDoc.data();
+          const normalizedDate = normalizeStoredDate(data?.date);
+
+          // A class record whose date cannot be interpreted makes the history check
+          // inconclusive: do not silently ignore it and then permit a save.
+          if (!normalizedDate) {
+            failHistoryLookup(
+              `Historical attendance record ${savedDoc.id} has a missing or malformed date. Correct that record before saving this register.`
+            );
+            return;
+          }
+
+          if (normalizedDate >= selectedDate) continue;
+
+          const validation = validateAttendanceRecord(data, selectedClassId, normalizedDate);
+          if (!validation.ok) {
+            failHistoryLookup(
+              `Historical attendance record ${savedDoc.id} is malformed (${validation.issue}). Correct it before saving this register.`
+            );
+            return;
+          }
+          candidateDates.push(normalizedDate);
+        }
+
+        if (!isActiveHistoryScope()) return;
+        candidateDates.sort((a, b) => b.localeCompare(a));
+        setLastSavedDate(candidateDates[0] ?? null);
+        setHistoryError('');
+        setHistoryStatus('ready');
+        setHistoryCheckedScope(checkedScope);
+        reportedHistoryErrorRef.current = '';
+      } catch (error: any) {
+        if (!isActiveHistoryScope()) return;
+        failHistoryLookup(
+          `${describeFirestoreError(error, 'historical attendance verification')} Saving is blocked until this check succeeds.`,
+          error
+        );
+      }
+    };
+
+    void runHistoricalLookup();
+    return () => { cancelled = true; };
+  }, [authResolved, tenantId, authUserUid, selectedClassId, selectedDate, isLoadingClasses, historyRetryNonce]);
 
   const handleClassChange = (classId: string) => {
     setSelectedClassId(classId);
@@ -786,8 +973,8 @@ export default function Attendance() {
     if (attendanceStatus === 'ready') return true;
     triggerErrorToast(
       attendanceStatus === 'error'
-        ? "Attendance could not be loaded. Please check your connection and try again."
-        : "Attendance is still loading. Please wait a moment."
+        ? (attendanceError || 'Attendance could not be verified. Use Retry attendance check and try again.')
+        : 'Attendance is still being verified with Firebase. Please wait a moment.'
     );
     return false;
   };
@@ -824,6 +1011,10 @@ export default function Attendance() {
   };
 
   const triggerErrorToast = (msg: string) => {
+    const now = Date.now();
+    const lastToast = lastErrorToastRef.current;
+    if (lastToast && lastToast.message === msg && now - lastToast.at < 2500) return;
+    lastErrorToastRef.current = { message: msg, at: now };
     setErrorMessage(msg);
     setShowErrorToast(true);
     if (errorToastTimerRef.current) clearTimeout(errorToastTimerRef.current);
@@ -834,8 +1025,17 @@ export default function Attendance() {
   };
 
   const handleToggleReady = () => {
+    if (!ensureAttendanceReady()) return;
     if (isAlreadySaved) {
       triggerErrorToast("Attendance is locked.");
+      return;
+    }
+    if (!isHistoryReadyForCurrentScope) {
+      triggerErrorToast(
+        isHistoryErrorForCurrentScope
+          ? (historyError || 'Historical attendance could not be verified. Retry the history check before submitting.')
+          : 'Historical attendance is still being verified. Please wait before confirming submission.'
+      );
       return;
     }
 
@@ -946,6 +1146,14 @@ export default function Attendance() {
       triggerErrorToast('Attendance is ALREADY saved for this date!');
       return;
     }
+    if (!isHistoryReadyForCurrentScope) {
+      triggerErrorToast(
+        isHistoryErrorForCurrentScope
+          ? (historyError || 'Historical attendance could not be verified. Retry the history check before saving.')
+          : 'Historical attendance is still being verified. Saving is blocked until the check completes.'
+      );
+      return;
+    }
     if (!isReadyToSave) {
       triggerErrorToast('Please check the verification box below before saving!');
       return;
@@ -995,6 +1203,14 @@ export default function Attendance() {
     }
     if (attendanceStatus !== 'ready' || !selectedClassId || !isValidDateStr(selectedDate)) {
       triggerErrorToast('Attendance is not ready to be saved yet. Please wait and try again.');
+      return;
+    }
+    if (!isHistoryReadyForCurrentScope) {
+      triggerErrorToast(
+        isHistoryErrorForCurrentScope
+          ? (historyError || 'Historical attendance could not be verified. Retry the history check before saving.')
+          : 'Historical attendance is still being verified. Saving is blocked until the check completes.'
+      );
       return;
     }
     if (!currentClass.students || currentClass.students.length === 0) {
@@ -1330,6 +1546,30 @@ export default function Attendance() {
           </div>
         )}
 
+        {/* CURRENT REGISTER / HISTORICAL SAFETY STATUS */}
+        {selectedClassId && selectedDate && attendanceStatus === 'loading' && (
+          <div className="bg-white dark:bg-[#0c1222] border border-orange-500/30 p-4 rounded-2xl text-orange-700 dark:text-orange-300 text-xs sm:text-sm font-bold" role="status" aria-live="polite">
+            <span className="animate-pulse">Verifying attendance for the selected date with Firebase. Editing and saving will remain disabled If an attendance record already exists..</span>
+          </div>
+        )}
+        {selectedClassId && selectedDate && attendanceStatus === 'error' && (
+          <div className="bg-rose-50 dark:bg-rose-950/20 border border-rose-300/70 dark:border-rose-900/50 p-4 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-rose-700 dark:text-rose-300" role="alert">
+            <span className="text-xs sm:text-sm font-bold">{attendanceError || 'The current-date attendance record could not be confirmed.'}</span>
+            <button type="button" onClick={() => { setAttendanceError(''); setAttendanceStatus('loading'); setAttendanceRetryNonce((n) => n + 1); }} className="shrink-0 rounded-xl bg-rose-600 hover:bg-rose-700 text-white px-3.5 py-2 text-xs font-black transition-all">Retry attendance check</button>
+          </div>
+        )}
+        {selectedClassId && selectedDate && !isHistoryReadyForCurrentScope && !isHistoryErrorForCurrentScope && (
+          <div className="bg-white dark:bg-[#0c1222] border border-slate-200 dark:border-slate-800 p-4 rounded-2xl text-slate-500 dark:text-slate-300 text-xs sm:text-sm font-bold" role="status" aria-live="polite">
+            <span className="animate-pulse">Checking previous attendance dates and holiday history…</span>
+          </div>
+        )}
+        {selectedClassId && selectedDate && isHistoryErrorForCurrentScope && (
+          <div className="bg-amber-50 dark:bg-amber-950/20 border border-amber-300/70 dark:border-amber-900/50 p-4 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-amber-800 dark:text-amber-200" role="alert">
+            <span className="text-xs sm:text-sm font-bold">{historyError || 'Historical attendance could not be verified. Saving is blocked.'}</span>
+            <button type="button" onClick={() => { setHistoryError(''); setHistoryStatus('loading'); setHistoryCheckedScope(''); setHistoryRetryNonce((n) => n + 1); }} className="shrink-0 rounded-xl bg-amber-600 hover:bg-amber-700 text-white px-3.5 py-2 text-xs font-black transition-all">Retry history check</button>
+          </div>
+        )}
+
         {/* FILTER CONTROL CARD */}
         <div className="bg-white dark:bg-[#0c1222] p-4 sm:p-5 rounded-3xl border border-slate-200/80 dark:border-slate-800/60 space-y-4">
           <div className="flex items-center gap-2 text-slate-800 dark:text-slate-100 font-extrabold text-base">
@@ -1478,13 +1718,13 @@ export default function Attendance() {
 
                     <button
                       type="button"
-                      disabled={isAlreadySaved}
+                      disabled={attendanceStatus !== 'ready' || isAlreadySaved}
                       onClick={(e) => {
                         e.stopPropagation();
                         toggleStudentStatus(student.id);
                       }}
                       className={`relative inline-flex h-7 w-12 sm:h-8 sm:w-14 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-all duration-300 ${
-                        isAlreadySaved ? 'opacity-60 cursor-not-allowed' : ''
+                        attendanceStatus !== 'ready' || isAlreadySaved ? 'opacity-60 cursor-not-allowed' : ''
                       } ${isPresent ? 'bg-emerald-500' : 'bg-rose-500'}`}
                     >
                       <span
@@ -1528,6 +1768,7 @@ export default function Attendance() {
         {/* VERIFICATION CHECKBOX CONTAINER */}
         <div 
           onClick={handleToggleReady}
+          aria-disabled={attendanceStatus !== 'ready' || isAlreadySaved || !isHistoryReadyForCurrentScope}
           className={`cursor-pointer transition-all duration-300 p-5 rounded-[1.75rem] border-2 flex items-center gap-4 select-none ${
             isReadyToSave
               ? 'bg-gradient-to-r from-orange-50/90 to-amber-50/70 dark:from-orange-950/30 dark:to-amber-950/20 border-orange-500 shadow-[0_0_30px_rgba(249,115,22,0.25)]'
@@ -1554,7 +1795,7 @@ export default function Attendance() {
         <div>
           <button
             onClick={handleSaveAttendance}
-            disabled={!isReadyToSave || isAlreadySaved}
+            disabled={!isReadyToSave || isAlreadySaved || attendanceStatus !== 'ready' || !isHistoryReadyForCurrentScope}
             className={`w-full py-4 sm:py-5 rounded-full font-black text-sm sm:text-base tracking-wide transition-all duration-300 flex items-center justify-center gap-2 ${
               isAlreadySaved
                 ? 'bg-slate-300 dark:bg-slate-800 text-slate-500 cursor-not-allowed opacity-80'
@@ -1812,8 +2053,8 @@ export default function Attendance() {
       )}
 
       {/* BOTTOM NAVIGATION NAVBAR */}
-      <div className="fixed bottom-0 left-0 right-0 z-50 px-4 pb-5 pt-2 bg-gradient-to-t from-[#f8fafc] via-[#f8fafc]/90 to-transparent dark:from-[#070b13] dark:via-[#070b13]/90 pointer-events-none">
-        <nav className="mx-auto max-w-md bg-white/95 dark:bg-[#0c1222]/95 backdrop-blur-xl border border-slate-200/80 dark:border-slate-800/80 rounded-[2.5rem] shadow-2xl px-4 py-3 flex items-center justify-around pointer-events-auto">
+        <div className="fixed bottom-0 left-0 right-0 z-40 px-4 pb-4 pt-2 bg-gradient-to-t from-[#f8fafc] via-[#f8fafc]/90 to-transparent dark:from-[#070b13] dark:via-[#070b13]/90">
+        <nav className="mx-auto max-w-md bg-white/80 dark:bg-[#0c1222]/90 backdrop-blur-xl border border-slate-200/50 dark:border-slate-800/40 rounded-3xl shadow-[0_15px_35px_-5px_rgba(0,0,0,0.08)] dark:shadow-[0_20px_40px_rgba(0,0,0,0.4)] px-3 py-2 flex items-center justify-between">
           {navigationTabs.map((tab) => {
             const IconComponent = tab.icon;
             const isActive = activeTab === tab.id;
@@ -1822,27 +2063,42 @@ export default function Attendance() {
               <Link
                 key={tab.id}
                 to={tab.href}
-                onClick={() => setActiveTab(tab.id)}
-                className="flex flex-col items-center justify-center flex-1 relative group"
+                onClick={() => {
+                  setActiveTab(tab.id);
+                  if (tab.id === 'classes' && activeClassId) {
+                    handleBackToClasses();
+                  }
+                }}
+                className="flex flex-col items-center justify-center flex-1 py-1 relative group"
               >
-                <div className={`p-2.5 rounded-full transition-all duration-300 flex items-center justify-center ${
-                  isActive 
-                    ? 'bg-orange-500 text-white shadow-[0_0_20px_rgba(249,115,22,0.6)] scale-110' 
-                    : 'text-slate-400 hover:text-slate-600 dark:hover:text-slate-300'
-                }`}>
-                  <IconComponent className="h-5 w-5" />
+                <div
+                  className={`p-2 rounded-2xl transition-all duration-300 relative ${
+                    isActive
+                      ? 'bg-orange-500 text-white shadow-md shadow-orange-500/30 scale-105'
+                      : 'text-slate-400 dark:text-slate-500 hover:text-slate-600 dark:hover:text-slate-300'
+                  }`}
+                >
+                  <IconComponent className="h-4 w-4" />
                 </div>
-                <span className={`text-[10px] font-black mt-1 transition-all ${
-                  isActive ? 'text-orange-500' : 'text-slate-400'
-                }`}>
+
+                <span
+                  className={`text-[9px] font-bold tracking-tight mt-1 transition-colors ${
+                    isActive
+                      ? 'text-orange-600 dark:text-orange-400 font-extrabold'
+                      : 'text-slate-400 dark:text-slate-500'
+                  }`}
+                >
                   {tab.label}
                 </span>
+
+                {isActive && (
+                  <div className="absolute top-0 h-1 w-1 bg-orange-500 rounded-full shadow-[0_0_8px_#f97316]" />
+                )}
               </Link>
             );
           })}
         </nav>
       </div>
-
     </div>
   );
 }

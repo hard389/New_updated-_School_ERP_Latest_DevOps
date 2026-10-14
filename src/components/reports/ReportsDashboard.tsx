@@ -1,19 +1,34 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { Button } from '@/components/ui/button';
 
 // FIREBASE IMPORTS
-import { initializeApp, getApps } from 'firebase/app';
-import { getAuth, onAuthStateChanged, User } from 'firebase/auth';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth, db } from '@/lib/firebase';
+import {
+  calculateMonthlyStudentMetrics,
+  getFeeStatusForStudent,
+  getMonthlyFeeRecords,
+  getReportMonthDateRange,
+  isAuthorizedTeacherProfile,
+  normalizeReportMonth,
+  normalizeReportRoster,
+  normalizeTenantEmail,
+  type ReportDocument,
+  type StudentReportMetrics,
+} from '@/components/reports/ReportsDashboard.logic';
 import { 
-  getFirestore, 
-  collection, 
-  onSnapshot, 
-  doc, 
+  collection,
+  onSnapshot,
+  doc,
   setDoc,
   deleteDoc,
   getDocs,
   addDoc,
-  serverTimestamp
+  serverTimestamp,
+  query,
+  where,
+  documentId,
+  Timestamp,
 } from 'firebase/firestore';
 
 // UI ICONS (Lucide React)
@@ -48,21 +63,6 @@ import {
   Calendar,
   Send
 } from 'lucide-react';
-
-// FIREBASE CONFIGURATION
-const firebaseConfig = {
-  apiKey: "AIzaSyAmHi20OGNteUXjuXO_weF8XKEa3KP7oYE",
-  authDomain: "tuition-management-b9e2f.firebaseapp.com",
-  projectId: "tuition-management-b9e2f",
-  storageBucket: "tuition-management-b9e2f.firebasestorage.app",
-  messagingSenderId: "634395063857",
-  appId: "1:634395063857:web:24d5e9c303845557f1c710",
-  measurementId: "G-5SS0BVJWTK"
-};
-
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
-const db = getFirestore(app);
-const auth = getAuth(app);
 
 // HELPER: Dynamic Month Info & Label Formatting
 const getTwoMonthsInfo = () => {
@@ -187,12 +187,13 @@ export const CATEGORY_CONFIG: Record<CategoryType, { color: string; badgeBg: str
 };
 
 export default function ReportsDashboard() {
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  // userEmail is set only after the authenticated Firebase identity is verified against users/{email}.
   const [userEmail, setUserEmail] = useState<string>('');
-  
+  const authGenerationRef = useRef(0);
+
   const [isDarkMode, setIsDarkMode] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [classList, setClassList] = useState<ClassItem[]>([]);
+  const [rawClassDocs, setRawClassDocs] = useState<Array<{ id: string; data: Record<string, any> }>>([]);
   const [loading, setLoading] = useState(true);
 
   const monthsInfo = useMemo(() => getTwoMonthsInfo(), []);
@@ -201,7 +202,9 @@ export default function ReportsDashboard() {
     { key: monthsInfo.currentKey, label: `Current: ${monthsInfo.currentLabel}` }
   ]);
 
-  const [realtimeMetrics, setRealtimeMetrics] = useState<Record<string, { presentDays: number; totalDays: number; attendancePct: string; quizObtained: number; quizTotal: number; quizDisplay: string }>>({});
+  const [realtimeMetricState, setRealtimeMetricState] = useState<{ scope: string; metrics: Record<string, StudentReportMetrics> } | null>(null);
+  const [reportState, setReportState] = useState<{ scope: string; byStudent: Record<string, Record<string, any>> } | null>(null);
+  const [feeRecordState, setFeeRecordState] = useState<{ scope: string; records: Record<string, any> } | null>(null);
   
   const [activeNav, setActiveNav] = useState<NavTab>('classes');
   const [activeClassId, setActiveClassId] = useState<string | null>(null);
@@ -227,21 +230,163 @@ export default function ReportsDashboard() {
     Poor: CATEGORY_CONFIG.Poor.defaultRemarks,
   });
 
-  // FIREBASE AUTHENTICATION LISTENER
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      if (user && user.email) {
-        setCurrentUser(user);
-        setUserEmail(user.email);
-      } else {
-        setCurrentUser(null);
-        setUserEmail('');
-        setLoading(false);
-      }
+  const currentReportScope = userEmail && activeClassId
+    ? `${userEmail}|${activeClassId}|${selectedMonth}`
+    : '';
+  const metricScope = currentReportScope;
+  const activeReports = reportState?.scope === currentReportScope ? reportState.byStudent : {};
+  const currentFeeRecords = feeRecordState?.scope === currentReportScope ? feeRecordState.records : {};
+  const realtimeMetrics = realtimeMetricState?.scope === metricScope ? realtimeMetricState.metrics : {};
+  const activeClassIsOwned = Boolean(userEmail && activeClassId && rawClassDocs.some((item) => item.id === activeClassId));
+  const activeRosterIds = useMemo(() => {
+    const activeDoc = rawClassDocs.find((item) => item.id === activeClassId);
+    return activeDoc ? normalizeReportRoster(activeDoc.data.students, activeDoc.data).map((student) => student.id) : [];
+  }, [rawClassDocs, activeClassId]);
+
+  const classList: ClassItem[] = useMemo(() => rawClassDocs.map(({ id: classId, data }) => {
+    const roster = normalizeReportRoster(data.students, data);
+    const students: Student[] = roster.map(({ id: stId, data: st }, index) => {
+      const metrics = classId === activeClassId ? realtimeMetrics[stId] : undefined;
+      const monthlyReport = classId === activeClassId ? activeReports[stId] : undefined;
+      const hasMonthlyCategory = Boolean(monthlyReport && Object.prototype.hasOwnProperty.call(monthlyReport, 'category'));
+      const rawCategory = hasMonthlyCategory
+        ? monthlyReport.category
+        : (selectedMonth === monthsInfo.currentKey ? st.category : null);
+      const category: CategoryType | null =
+        rawCategory === 'Excellent' || rawCategory === 'Good' || rawCategory === 'Average' || rawCategory === 'Poor'
+          ? rawCategory
+          : null;
+      const grades = category ? (dynamicCriteria[category] || CATEGORY_GRADES_MAP[category]) : CATEGORY_GRADES_MAP.Good;
+      const feeRecord = classId === activeClassId ? currentFeeRecords[stId] : undefined;
+
+      return {
+        id: stId,
+        name: typeof st.name === 'string' && st.name.trim() ? st.name : 'Unknown Student',
+        rollNo: st.rollNo === undefined || st.rollNo === null ? String(index + 1) : String(st.rollNo),
+        avatar: st.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${encodeURIComponent(String(st.name || index + 1))}`,
+        attendanceRate: metrics?.attendancePct || '—',
+        quizScore: metrics?.quizDisplay || '—',
+        category,
+        phone: typeof st.phone === 'string' ? st.phone : '',
+        fatherPhone: typeof st.fatherPhone === 'string' ? st.fatherPhone : (typeof st.phone === 'string' ? st.phone : ''),
+        feeStatus: getFeeStatusForStudent(feeRecord, st.feeStatus, selectedMonth === monthsInfo.currentKey),
+        homeworkGrade: grades.homework,
+        behaviorGrade: grades.behavior,
+        participationGrade: grades.participation,
+        performanceGrade: grades.performance,
+        remarks: typeof monthlyReport?.remarks === 'string' ? monthlyReport.remarks : (typeof st.remarks === 'string' ? st.remarks : undefined),
+        lastWhatsAppSentMonth: typeof monthlyReport?.lastWhatsAppSentMonth === 'string'
+          ? monthlyReport.lastWhatsAppSentMonth
+          : (typeof st.lastWhatsAppSentMonth === 'string' ? st.lastWhatsAppSentMonth : ''),
+      };
     });
 
-    return () => unsubscribe();
-  }, []);
+    students.sort((a, b) => {
+      const numA = parseInt(a.rollNo.replace(/\D/g, ''), 10) || 0;
+      const numB = parseInt(b.rollNo.replace(/\D/g, ''), 10) || 0;
+      return numA - numB;
+    });
+
+    return {
+      id: classId,
+      name: data.className || data.name || 'Unnamed Class',
+      code: data.subject || data.code || 'NO-CODE',
+      students,
+    };
+  }), [rawClassDocs, activeClassId, realtimeMetrics, activeReports, currentFeeRecords, dynamicCriteria, selectedMonth, monthsInfo.currentKey]);
+
+  // AUTHENTICATION + TENANT PROFILE VERIFICATION (fail closed; no email/UID fallback).
+  useEffect(() => {
+    let disposed = false;
+    let unsubscribeProfile: (() => void) | null = null;
+
+    const unsubscribeAuth = onAuthStateChanged(
+      auth,
+      (user) => {
+        const generation = ++authGenerationRef.current;
+        unsubscribeProfile?.();
+        unsubscribeProfile = null;
+
+        // Clear all previous-session data immediately so teacher A's records cannot flash for teacher B.
+        setUserEmail('');
+        setRawClassDocs([]);
+        setRealtimeMetricState(null);
+        setReportState(null);
+        setFeeRecordState(null);
+        setAvailableMonths([{ key: monthsInfo.currentKey, label: `Current: ${monthsInfo.currentLabel}` }]);
+        setActiveClassId(null);
+        setSelectedStudentIds([]);
+        setDynamicCriteria(CATEGORY_GRADES_MAP);
+        setCategoryPresets({
+          Excellent: CATEGORY_CONFIG.Excellent.defaultRemarks,
+          Good: CATEGORY_CONFIG.Good.defaultRemarks,
+          Average: CATEGORY_CONFIG.Average.defaultRemarks,
+          Poor: CATEGORY_CONFIG.Poor.defaultRemarks,
+        });
+        setIsSettingsConfigured(false);
+        setLoading(Boolean(user));
+
+        if (!user?.uid || !user.email) {
+          setLoading(false);
+          return;
+        }
+
+        const tenantEmail = normalizeTenantEmail(user.email);
+        if (!tenantEmail) {
+          console.error('[Reports] Refusing tenant access because the authenticated email is invalid.');
+          setLoading(false);
+          return;
+        }
+
+        unsubscribeProfile = onSnapshot(
+          doc(db, 'users', tenantEmail),
+          (profileSnapshot) => {
+            if (disposed || generation !== authGenerationRef.current) return;
+            const profile = profileSnapshot.exists() ? profileSnapshot.data() : null;
+            if (!isAuthorizedTeacherProfile(profile, { uid: user.uid, email: tenantEmail })) {
+              console.error('[Reports] Tenant profile verification failed; no tenant data will be loaded.');
+              setUserEmail('');
+              setRawClassDocs([]);
+              setRealtimeMetricState(null);
+              setReportState(null);
+              setFeeRecordState(null);
+              setLoading(false);
+              return;
+            }
+            setUserEmail(tenantEmail);
+          },
+          (error) => {
+            if (disposed || generation !== authGenerationRef.current) return;
+            console.error('[Reports] Tenant profile listener failed:', error);
+            setUserEmail('');
+            setRawClassDocs([]);
+            setRealtimeMetricState(null);
+            setReportState(null);
+            setFeeRecordState(null);
+            setLoading(false);
+          }
+        );
+      },
+      (error) => {
+        if (disposed) return;
+        console.error('[Reports] Authentication state listener failed:', error);
+        ++authGenerationRef.current;
+        setUserEmail('');
+        setRawClassDocs([]);
+        setRealtimeMetricState(null);
+        setReportState(null);
+        setFeeRecordState(null);
+        setLoading(false);
+      }
+    );
+
+    return () => {
+      disposed = true;
+      ++authGenerationRef.current;
+      unsubscribeProfile?.();
+      unsubscribeAuth();
+    };
+  }, [monthsInfo]);
 
   useEffect(() => {
     if (isDarkMode) {
@@ -268,55 +413,61 @@ export default function ReportsDashboard() {
       : 'bg-slate-50 border-slate-200/60 text-slate-800';
   };
 
-  // AUTOMATIC CLEANUP & DATE 5 PURGE LOGIC
+  // AUTOMATIC CLEANUP: on/after day 5, purge only the previous month's automatic report configs.
+  // The deterministic notification ID prevents duplicate reset notifications when listeners refresh.
   useEffect(() => {
-    if (!activeClassId || !userEmail) return;
+    if (!activeClassId || !userEmail || !activeClassIsOwned || new Date().getDate() < 5) return;
 
+    let cancelled = false;
     const autoCleanOldReports = async () => {
       try {
-        const today = new Date();
-        const isDate5OrAfter = today.getDate() >= 5;
-        const autoReportsRef = collection(db, 'users', userEmail, 'classes', activeClassId, 'reports');
+        const reportsRef = collection(db, 'users', userEmail, 'classes', activeClassId, 'reports');
+        const previousMonthQuery = query(reportsRef, where('monthKey', '==', monthsInfo.previousKey));
+        const snapshot = await getDocs(previousMonthQuery);
+        if (cancelled) return;
 
-        const autoSnap = await getDocs(autoReportsRef);
-
-        if (isDate5OrAfter) {
-          autoSnap.docs.forEach(async (docSnap) => {
-            const data = docSnap.data();
-            if (data.monthKey && data.monthKey !== monthsInfo.currentKey) {
-              await deleteDoc(doc(db, 'users', userEmail, 'classes', activeClassId, 'reports', docSnap.id));
-            }
-          });
-
-          const notifRef = collection(db, 'users', userEmail, 'notifications');
-          await addDoc(notifRef, {
-            title: "Reports Reset Notification",
-            message: `On Date 5, previous month Automatic reports configurations have been cleared for class ${activeClassId}. Re-generate reports required.`,
-            type: "reports_reset",
-            createdAt: serverTimestamp(),
-            read: false
-          });
+        for (const reportSnap of snapshot.docs) {
+          if (cancelled) return;
+          const data = reportSnap.data();
+          if (data.monthKey === monthsInfo.previousKey && data.mode === 'automatic') {
+            await deleteDoc(doc(db, 'users', userEmail, 'classes', activeClassId, 'reports', reportSnap.id));
+          }
         }
+
+        if (cancelled) return;
+        const notificationRef = doc(
+          db,
+          'users',
+          userEmail,
+          'notifications',
+          `reports_reset_${activeClassId}_${monthsInfo.currentKey}`
+        );
+        await setDoc(notificationRef, {
+          title: 'Reports Reset Notification',
+          message: `On Date 5, previous month Automatic reports configurations have been cleared for class ${activeClassId}. Re-generate reports required.`,
+          type: 'reports_reset',
+          createdAt: serverTimestamp(),
+          read: false,
+        }, { merge: true });
       } catch (err) {
-        console.error("Auto delete reports error:", err);
+        if (!cancelled) console.error('[Reports] Automatic report cleanup failed:', err);
       }
     };
 
-    autoCleanOldReports();
-  }, [activeClassId, userEmail, monthsInfo]);
+    void autoCleanOldReports();
+    return () => { cancelled = true; };
+  }, [activeClassId, userEmail, activeClassIsOwned, monthsInfo]);
 
-  // LISTEN TO FIRESTORE RULES
+  // LISTEN TO TENANT-SCOPED GRADING RULES.
   useEffect(() => {
     if (!userEmail) return;
 
     const rulesDocRef = doc(db, 'users', userEmail, 'settings', 'grading_rules');
-
-    const unsubRules = onSnapshot(rulesDocRef, (docSnap) => {
+    const unsubscribe = onSnapshot(rulesDocRef, (docSnap) => {
       if (docSnap.exists()) {
         const data = docSnap.data();
         const remarksMap = data.remarksMap || {};
         const rulesMap = data.rulesMap || data.criteriaMap || {};
-
         const requiredCats: CategoryType[] = ['Excellent', 'Good', 'Average', 'Poor'];
         const missing: string[] = [];
 
@@ -330,7 +481,6 @@ export default function ReportsDashboard() {
           setIsSettingsConfigured(false);
         } else {
           setIsSettingsConfigured(true);
-          
           setCategoryPresets({
             Excellent: typeof remarksMap.Excellent === 'string' ? remarksMap.Excellent : CATEGORY_CONFIG.Excellent.defaultRemarks,
             Good: typeof remarksMap.Good === 'string' ? remarksMap.Good : CATEGORY_CONFIG.Good.defaultRemarks,
@@ -356,180 +506,233 @@ export default function ReportsDashboard() {
       } else {
         setIsSettingsConfigured(false);
       }
-    }, (err) => {
-      console.error("Grading Rules fetch error:", err);
+    }, (error) => {
+      console.error('[Reports] Grading rules listener failed:', error);
       setIsSettingsConfigured(false);
     });
 
-    return () => unsubRules();
+    return () => unsubscribe();
   }, [userEmail]);
 
-  // LISTEN TO FIRESTORE CLASSES & SORT STUDENTS ROLL-NO WISE
+  // CLASSES: canonical roster is the `students` field on each class document (array or legacy map).
   useEffect(() => {
-    if (!userEmail) return;
+    if (!userEmail) {
+      setRawClassDocs([]);
+      setLoading(false);
+      return;
+    }
 
+    let cancelled = false;
+    setLoading(true);
     const classesRef = collection(db, 'users', userEmail, 'classes');
-
-    const unsubscribe = onSnapshot(classesRef, async (snapshot) => {
-      const fetchedClasses: ClassItem[] = [];
-
-      for (const docSnap of snapshot.docs) {
-        const data = docSnap.data();
-        const classId = docSnap.id;
-
-        let monthReportsMap: Record<string, CategoryType> = {};
-        let dbMonthKeysSet = new Set<string>();
-
-        if (activeClassId === classId) {
-          try {
-            const reportsRef = collection(db, 'users', userEmail, 'classes', classId, 'reports');
-            const reportsSnap = await getDocs(reportsRef);
-            reportsSnap.docs.forEach((rDoc) => {
-              const rData = rDoc.data();
-              if (rData.monthKey) dbMonthKeysSet.add(rData.monthKey);
-              if (rData.monthKey === selectedMonth && rData.studentId) {
-                monthReportsMap[rData.studentId] = rData.category;
-              }
-            });
-
-            const existingKeys = Array.from(new Set([monthsInfo.currentKey, ...Array.from(dbMonthKeysSet)]));
-            existingKeys.sort((a, b) => b.localeCompare(a));
-
-            const formattedOptions = existingKeys.map((key) => ({
-              key,
-              label: formatMonthLabel(key)
-            }));
-
-            setAvailableMonths(formattedOptions);
-
-          } catch (e) {
-            console.error("Error loading month reports", e);
-          }
-        }
-
-        const studentList: Student[] = (data.students || []).map((st: any, idx: number) => {
-          const stId = st.id !== undefined && st.id !== null ? String(st.id) : `st-${idx + 1}`;
-          const rollStr = String(st.rollNo || `${idx + 1}`);
-          
-          const metrics = realtimeMetrics[stId] || realtimeMetrics[rollStr];
-          const cat = monthReportsMap[stId] !== undefined ? monthReportsMap[stId] : ((st.category as CategoryType) || null);
-          const grades = cat ? dynamicCriteria[cat] : CATEGORY_GRADES_MAP.Good;
-
-          return {
-            id: stId,
-            name: st.name || 'Unknown Student',
-            rollNo: rollStr,
-            avatar: st.avatar || `https://api.dicebear.com/7.x/avataaars/svg?seed=${st.name || idx}`,
-            attendanceRate: metrics?.attendancePct || st.attendanceRate || '0%',
-            quizScore: metrics?.quizDisplay || st.quizScore || '0/20',
-            category: cat,
-            phone: st.phone || '',
-            fatherPhone: st.fatherPhone || st.phone || '',
-            feeStatus: st.feeStatus || 'Paid',
-            homeworkGrade: grades.homework,
-            behaviorGrade: grades.behavior,
-            participationGrade: grades.participation,
-            performanceGrade: grades.performance,
-            lastWhatsAppSentMonth: st.lastWhatsAppSentMonth || ''
-          };
-        });
-
-        studentList.sort((a, b) => {
-          const numA = parseInt(a.rollNo.replace(/\D/g, ''), 10) || 0;
-          const numB = parseInt(b.rollNo.replace(/\D/g, ''), 10) || 0;
-          return numA - numB;
-        });
-
-        fetchedClasses.push({
-          id: classId,
-          name: data.className || data.name || 'Unnamed Class',
-          code: data.subject || data.code || 'NO-CODE',
-          students: studentList
-        });
-      }
-
-      setClassList(fetchedClasses);
+    const unsubscribe = onSnapshot(classesRef, (snapshot) => {
+      if (cancelled) return;
+      setRawClassDocs(snapshot.docs.map((classSnap) => ({ id: classSnap.id, data: classSnap.data() })));
       setLoading(false);
     }, (error) => {
-      console.error("Firebase Classes Listener Error: ", error);
+      if (cancelled) return;
+      console.error('[Reports] Tenant classes listener failed:', error);
+      setRawClassDocs([]);
       setLoading(false);
     });
 
-    return () => unsubscribe();
-  }, [userEmail, realtimeMetrics, dynamicCriteria, selectedMonth, activeClassId, monthsInfo]);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [userEmail]);
 
-  // LIVE QUIZZES & ATTENDANCE
+  // REPORT ASSIGNMENTS + MONTH MENU: reads stay under the authenticated tenant and selected class.
   useEffect(() => {
-    if (!activeClassId || !userEmail) return;
+    if (!userEmail || !activeClassId || !activeClassIsOwned) {
+      setReportState(null);
+      return;
+    }
 
-    const attendanceRef = collection(db, 'users', userEmail, 'attendance');
-    const unsubAttendance = onSnapshot(attendanceRef, (attSnap) => {
-      const attStats: Record<string, { present: number; total: number }> = {};
+    let cancelled = false;
+    const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+    setReportState(null);
+    const reportsRef = collection(db, 'users', userEmail, 'classes', activeClassId, 'reports');
+    const unsubscribe = onSnapshot(reportsRef, (snapshot) => {
+      if (cancelled) return;
+      const byStudent: Record<string, Record<string, any>> = {};
+      const monthKeys = new Set<string>([monthsInfo.currentKey, selectedMonth]);
 
-      attSnap.docs.forEach(docSnap => {
-        const d = docSnap.data();
-        if (d.classId === activeClassId) {
-          const map = d.attendanceMap || d.records || {};
-          Object.entries(map).forEach(([sId, status]) => {
-            if (!attStats[sId]) attStats[sId] = { present: 0, total: 0 };
-            attStats[sId].total += 1;
-            if (status === true || status === 'present' || status === 'P') {
-              attStats[sId].present += 1;
-            }
-          });
+      snapshot.docs.forEach((reportSnap) => {
+        const data = reportSnap.data();
+        const monthKey = normalizeReportMonth(data.monthKey);
+        if (monthKey) monthKeys.add(monthKey);
+        if (monthKey === selectedMonth && data.studentId !== undefined && data.studentId !== null) {
+          byStudent[String(data.studentId)] = data;
         }
       });
 
-      const quizzesRef = collection(db, 'users', userEmail, 'classes', activeClassId, 'quizzes');
-      const unsubQuizzes = onSnapshot(quizzesRef, (quizSnap) => {
-        const quizStats: Record<string, { totalObtained: number; totalMax: number }> = {};
-
-        quizSnap.docs.forEach(qDoc => {
-          const qData = qDoc.data();
-          const maxMarks = Number(qData.totalMarks || 20);
-          const studentScoresArr: QuizStudentScore[] = qData.studentScores || qData.studentsScores || [];
-
-          if (Array.isArray(studentScoresArr)) {
-            studentScoresArr.forEach((item) => {
-              const studentIdKey = item.id ? String(item.id) : null;
-              const rollNoKey = item.rollNo ? String(item.rollNo) : null;
-              const keysToUpdate = [studentIdKey, rollNoKey].filter(Boolean) as string[];
-
-              keysToUpdate.forEach(k => {
-                if (!quizStats[k]) quizStats[k] = { totalObtained: 0, totalMax: 0 };
-                quizStats[k].totalObtained += Number(item.marksObtained || 0);
-                quizStats[k].totalMax += maxMarks;
-              });
-            });
-          }
-        });
-
-        const combined: Record<string, { presentDays: number; totalDays: number; attendancePct: string; quizObtained: number; quizTotal: number; quizDisplay: string }> = {};
-        const allStudentKeys = new Set([...Object.keys(attStats), ...Object.keys(quizStats)]);
-
-        allStudentKeys.forEach(k => {
-          const att = attStats[k] || { present: 24, total: 28 };
-          const qz = quizStats[k] || { totalObtained: 0, totalMax: 20 };
-          const pct = att.total > 0 ? ((att.present / att.total) * 100).toFixed(1) + '%' : '0%';
-
-          combined[k] = {
-            presentDays: att.present,
-            totalDays: att.total,
-            attendancePct: pct,
-            quizObtained: qz.totalObtained,
-            quizTotal: qz.totalMax,
-            quizDisplay: `${qz.totalObtained}/${qz.totalMax}`
-          };
-        });
-
-        setRealtimeMetrics(combined);
-      });
-
-      return () => unsubQuizzes();
+      const keys = Array.from(monthKeys).sort((a, b) => b.localeCompare(a));
+      setAvailableMonths(keys.map((key) => ({ key, label: formatMonthLabel(key) })));
+      setReportState({ scope, byStudent });
+    }, (error) => {
+      if (cancelled) return;
+      console.error('[Reports] Monthly report listener failed:', error);
+      setAvailableMonths([
+        { key: monthsInfo.currentKey, label: `Current: ${monthsInfo.currentLabel}` },
+        ...(selectedMonth !== monthsInfo.currentKey ? [{ key: selectedMonth, label: formatMonthLabel(selectedMonth) }] : []),
+      ]);
+      setReportState({ scope, byStudent: {} });
     });
 
-    return () => unsubAttendance();
-  }, [activeClassId, userEmail]);
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [userEmail, activeClassId, activeClassIsOwned, selectedMonth, monthsInfo]);
+
+  // MONTHLY FEES: read only users/{teacher}/fees/{classId}_{YYYY-MM}; fee status is not guessed.
+  useEffect(() => {
+    if (!userEmail || !activeClassId || !activeClassIsOwned) {
+      setFeeRecordState(null);
+      return;
+    }
+
+    let cancelled = false;
+    const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+    setFeeRecordState({ scope, records: {} });
+    const feeRef = doc(db, 'users', userEmail, 'fees', `${activeClassId}_${selectedMonth}`);
+    const unsubscribe = onSnapshot(feeRef, (snapshot) => {
+      if (cancelled) return;
+      const feeData = snapshot.exists() ? snapshot.data() : null;
+      const records = getMonthlyFeeRecords(feeData, activeClassId, selectedMonth);
+      setFeeRecordState({ scope, records });
+    }, (error) => {
+      if (cancelled) return;
+      console.error('[Reports] Monthly fee record listener failed:', error);
+      setFeeRecordState({ scope, records: {} });
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, [userEmail, activeClassId, activeClassIsOwned, selectedMonth]);
+
+  // ATTENDANCE + QUIZZES: class-roster-only metrics for the exact selected calendar month.
+  useEffect(() => {
+    if (!userEmail || !activeClassId || !activeClassIsOwned || !selectedMonth) {
+      setRealtimeMetricState(null);
+      return;
+    }
+
+    const range = getReportMonthDateRange(selectedMonth);
+    if (!range) {
+      setRealtimeMetricState(null);
+      return;
+    }
+
+    const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+    setRealtimeMetricState({ scope, metrics: {} });
+    if (activeRosterIds.length === 0) return;
+
+    let cancelled = false;
+    let attendanceLoaded = false;
+    let attendanceRows: ReportDocument[] = [];
+    let quizFallbackStarted = false;
+    let quizFallbackLoaded = false;
+    let quizFallbackRows: ReportDocument[] = [];
+    const quizRowsByQuery: Array<ReportDocument[] | null> = [null, null, null];
+    const quizUnsubscribers: Array<() => void> = [];
+    let unsubscribeQuizFallback: (() => void) | null = null;
+
+    const getQuizRows = (): ReportDocument[] => {
+      if (quizFallbackStarted) return quizFallbackRows;
+      const byId = new Map<string, ReportDocument>();
+      quizRowsByQuery.forEach((rows) => {
+        (rows || []).forEach((row) => byId.set(row.id, row));
+      });
+      return Array.from(byId.values());
+    };
+
+    const publishMetrics = () => {
+      if (cancelled || !attendanceLoaded) return;
+      if (quizFallbackStarted ? !quizFallbackLoaded : quizRowsByQuery.some((rows) => rows === null)) return;
+      const quizRows = getQuizRows();
+      const metrics = calculateMonthlyStudentMetrics(
+        activeRosterIds,
+        attendanceRows,
+        quizRows,
+        activeClassId,
+        selectedMonth
+      );
+      setRealtimeMetricState({ scope, metrics });
+    };
+
+    const attendanceRef = collection(db, 'users', userEmail, 'attendance');
+    // The documented schema IDs are `{classId}_{YYYY-MM-DD}`. Query by the bounded
+    // document-ID interval so legacy records without `classId`/`date` fields are not missed,
+    // while still reading only the selected tenant, class and month.
+    const monthlyAttendanceQuery = query(
+      attendanceRef,
+      where(documentId(), '>=', `${activeClassId}_${range.startDate}`),
+      where(documentId(), '<', `${activeClassId}_${range.nextMonthStartDate}`)
+    );
+    const unsubscribeAttendance = onSnapshot(monthlyAttendanceQuery, (snapshot) => {
+      if (cancelled) return;
+      attendanceRows = snapshot.docs.map((item) => ({ id: item.id, data: item.data() }));
+      attendanceLoaded = true;
+      publishMetrics();
+    }, (error) => {
+      if (cancelled) return;
+      console.error('[Reports] Monthly attendance listener failed:', error);
+      attendanceRows = [];
+      attendanceLoaded = true;
+      publishMetrics();
+    });
+
+    const quizRef = collection(db, 'users', userEmail, 'classes', activeClassId, 'quizzes');
+    const monthLabel = range.start.toLocaleString('en-US', { month: 'long', year: 'numeric' });
+    const quizQueries = [
+      query(quizRef, where('monthKey', 'in', [selectedMonth, monthLabel])),
+      query(quizRef, where('date', '>=', range.startDate), where('date', '<=', range.endDate)),
+      query(quizRef, where('createdAt', '>=', Timestamp.fromDate(range.start)), where('createdAt', '<', Timestamp.fromDate(range.nextMonthStart))),
+    ];
+
+    const startQuizFallback = () => {
+      if (cancelled || quizFallbackStarted) return;
+      quizFallbackStarted = true;
+      quizUnsubscribers.forEach((unsubscribe) => unsubscribe());
+      quizFallbackRows = [];
+      unsubscribeQuizFallback = onSnapshot(quizRef, (snapshot) => {
+        if (cancelled) return;
+        quizFallbackRows = snapshot.docs.map((item) => ({ id: item.id, data: item.data() }));
+        quizFallbackLoaded = true;
+        publishMetrics();
+      }, (error) => {
+        if (cancelled) return;
+        console.error('[Reports] Class quiz listener failed:', error);
+        quizFallbackRows = [];
+        quizFallbackLoaded = true;
+        publishMetrics();
+      });
+    };
+
+    quizQueries.forEach((quizQuery, queryIndex) => {
+      const unsubscribe = onSnapshot(quizQuery, (snapshot) => {
+        if (cancelled || quizFallbackStarted) return;
+        quizRowsByQuery[queryIndex] = snapshot.docs.map((item) => ({ id: item.id, data: item.data() }));
+        publishMetrics();
+      }, (error) => {
+        if (cancelled) return;
+        console.warn('[Reports] Monthly quiz query failed; switching to the selected class fallback query:', error);
+        startQuizFallback();
+      });
+      quizUnsubscribers.push(unsubscribe);
+    });
+
+    return () => {
+      cancelled = true;
+      unsubscribeAttendance();
+      quizUnsubscribers.forEach((unsubscribe) => unsubscribe());
+      unsubscribeQuizFallback?.();
+    };
+  }, [userEmail, activeClassId, activeClassIsOwned, activeRosterIds, selectedMonth]);
 
   const filteredClasses = useMemo(() => {
     return classList.filter(c => 
@@ -579,15 +782,34 @@ export default function ReportsDashboard() {
       return;
     }
 
+    if (!activeClassId || !activeClassIsOwned || !currentClass?.students.some((item) => String(item.id) === String(student.id))) {
+      showToast('Report Unavailable', 'The selected student is not part of the authorized class.');
+      return;
+    }
+
     const cat = student.category || 'Good';
     const msg = `Dear Parent,\nHere is the Weekly Report for *${student.name}* (Roll No: ${student.rollNo}):\n*Category:* ${cat}\n*Remarks:* ${student.remarks || categoryPresets[cat]}\n*Quiz:* ${student.quizScore}\n*Attendance:* ${student.attendanceRate}\n\nGenerated automatically via Tuition Management System.`;
     const url = `https://wa.me/${fatherNumber}?text=${encodeURIComponent(msg)}`;
 
     try {
-      if (activeClassId) {
+      {
         const reportDocId = `${student.id}_${selectedMonth}`;
         const autoRef = doc(db, 'users', userEmail, 'classes', activeClassId, 'reports', reportDocId);
-        await setDoc(autoRef, { lastWhatsAppSentMonth: selectedMonth }, { merge: true });
+        await setDoc(autoRef, {
+          studentId: String(student.id),
+          studentName: student.name,
+          rollNo: student.rollNo,
+          monthKey: selectedMonth,
+          mode: 'automatic',
+          lastWhatsAppSentMonth: selectedMonth,
+          updatedAt: serverTimestamp(),
+        }, { merge: true });
+        setReportState((previous) => {
+          const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+          const byStudent = previous?.scope === scope ? { ...previous.byStudent } : {};
+          byStudent[String(student.id)] = { ...(byStudent[String(student.id)] || {}), studentId: String(student.id), studentName: student.name, rollNo: student.rollNo, monthKey: selectedMonth, mode: 'automatic', lastWhatsAppSentMonth: selectedMonth };
+          return { scope, byStudent };
+        });
 
         const notifRef = collection(db, 'users', userEmail, 'notifications');
         await addDoc(notifRef, {
@@ -614,18 +836,35 @@ export default function ReportsDashboard() {
 
     if (!activeClassId || !currentClass || selectedStudentIds.length === 0 || !userEmail) return;
 
-    const updatedStudents = currentClass.students.map((s) => {
-      const isSelected = selectedStudentIds.some((id) => String(id) === String(s.id));
-      return isSelected ? { ...s, category: activeCategoryTab } : s;
+    if (!activeClassIsOwned || !classList.some((cls) => cls.id === activeClassId)) return;
+
+    const selectedIdsCopy = selectedStudentIds.filter((studentId) =>
+      currentClass.students.some((student) => String(student.id) === String(studentId))
+    );
+    if (selectedIdsCopy.length === 0) {
+      setSelectedStudentIds([]);
+      return;
+    }
+    const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+    setReportState((previous) => {
+      const byStudent = previous?.scope === scope ? { ...previous.byStudent } : {};
+      selectedIdsCopy.forEach((studentId) => {
+        const student = currentClass.students.find((item) => String(item.id) === String(studentId));
+        if (!student) return;
+        byStudent[String(student.id)] = {
+          ...(byStudent[String(student.id)] || {}),
+          studentId: String(student.id),
+          studentName: student.name,
+          rollNo: student.rollNo,
+          category: activeCategoryTab,
+          monthKey: selectedMonth,
+          remarks: categoryPresets[activeCategoryTab] || CATEGORY_CONFIG[activeCategoryTab].defaultRemarks,
+          mode: 'automatic',
+        };
+      });
+      return { scope, byStudent };
     });
 
-    setClassList((prevClasses) =>
-      prevClasses.map((cls) =>
-        cls.id === activeClassId ? { ...cls, students: updatedStudents } : cls
-      )
-    );
-
-    const selectedIdsCopy = [...selectedStudentIds];
     setSelectedStudentIds([]);
 
     try {
@@ -668,20 +907,38 @@ export default function ReportsDashboard() {
   const handleRemoveFromCategory = async (studentId: string | number) => {
     if (!activeClassId || !currentClass || !userEmail) return;
 
-    const updatedStudents = currentClass.students.map((s) =>
-      String(s.id) === String(studentId) ? { ...s, category: null } : s
-    );
-
-    setClassList((prevClasses) =>
-      prevClasses.map((cls) =>
-        cls.id === activeClassId ? { ...cls, students: updatedStudents } : cls
-      )
-    );
+    if (!activeClassIsOwned || !currentClass.students.some((item) => String(item.id) === String(studentId))) return;
+    const student = currentClass.students.find((item) => String(item.id) === String(studentId));
+    if (!student) return;
+    const scope = `${userEmail}|${activeClassId}|${selectedMonth}`;
+    setReportState((previous) => {
+      const byStudent = previous?.scope === scope ? { ...previous.byStudent } : {};
+      byStudent[String(studentId)] = {
+        ...(byStudent[String(studentId)] || {}),
+        studentId: String(studentId),
+        studentName: student.name,
+        rollNo: student.rollNo,
+        monthKey: selectedMonth,
+        category: null,
+        mode: 'automatic',
+      };
+      return { scope, byStudent };
+    });
 
     try {
       const reportDocId = `${studentId}_${selectedMonth}`;
       const reportDocRef = doc(db, 'users', userEmail, 'classes', activeClassId, 'reports', reportDocId);
-      await deleteDoc(reportDocRef);
+      // Persist an explicit unassigned state. Deleting the record let the legacy class.category
+      // reappear on refresh and made a monthly category reset non-deterministic.
+      await setDoc(reportDocRef, {
+        studentId: String(student.id),
+        studentName: student.name,
+        rollNo: student.rollNo,
+        monthKey: selectedMonth,
+        category: null,
+        mode: 'automatic',
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
       showToast("Category Reset", "Student moved back to unassigned list.");
     } catch (err) {
       console.error("Failed to remove student from category:", err);
@@ -701,11 +958,11 @@ export default function ReportsDashboard() {
     const catConfig = CATEGORY_CONFIG[cat];
     const catCriteria = dynamicCriteria[cat] || CATEGORY_GRADES_MAP[cat];
 
-    const metrics = realtimeMetrics[String(student.id)] || realtimeMetrics[String(student.rollNo)] || {
-      presentDays: 24,
-      totalDays: 28,
-      attendancePct: student.attendanceRate || '85.7%',
-      quizDisplay: student.quizScore || '0/20'
+    const metrics = realtimeMetrics[String(student.id)] || {
+      presentDays: 0,
+      totalDays: 0,
+      attendancePct: '—',
+      quizDisplay: '—',
     };
 
     return (
@@ -802,7 +1059,7 @@ export default function ReportsDashboard() {
           <div className="flex items-center gap-2">
             <span className="text-[11px] font-black text-slate-800">Fee Status</span>
             <span className="bg-emerald-100 text-emerald-700 text-[10px] font-black px-3 py-0.5 rounded-full">
-              {student.feeStatus || 'Paid'}
+              {student.feeStatus || 'Unrecorded'}
             </span>
           </div>
 
@@ -1238,9 +1495,9 @@ export default function ReportsDashboard() {
                       {paginatedUnassignedStudents.map((student) => {
                         const isChecked = selectedStudentIds.some((id) => String(id) === String(student.id));
                         
-                        const liveMetrics = realtimeMetrics[String(student.id)] || realtimeMetrics[String(student.rollNo)] || {
-                          attendancePct: student.attendanceRate || '0%',
-                          quizDisplay: student.quizScore || '0/20'
+                        const liveMetrics = realtimeMetrics[String(student.id)] || {
+                          attendancePct: '—',
+                          quizDisplay: '—',
                         };
 
                         return (

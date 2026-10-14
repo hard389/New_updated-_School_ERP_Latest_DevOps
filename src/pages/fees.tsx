@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import {
   Bell,
@@ -24,12 +24,15 @@ import {
   PlusCircle,
   Layers,
   Search,
-  Check
+  Check,
+  FileText,
+  Download,
+  Printer
 } from 'lucide-react';
 
 import { db, auth } from '../lib/firebase';
 import { onAuthStateChanged } from 'firebase/auth';
-import { doc, collection, getDoc, onSnapshot, runTransaction, FieldPath } from 'firebase/firestore';
+import { doc, collection, getDoc, getDocFromServer, getDocsFromServer, onSnapshot, runTransaction, FieldPath, query, orderBy, startAt, endAt, documentId, limit, where } from 'firebase/firestore';
 import type { DocumentData, DocumentReference, Transaction, DocumentSnapshot } from 'firebase/firestore';
 
 interface StudentFeeRecord {
@@ -63,7 +66,9 @@ const parseOptionalMoney = (value: any): number | null => {
   if (typeof value === 'string' && value.trim() === '') return null;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return null;
-  return roundMoney(parsed);
+  const rounded = roundMoney(parsed);
+  if (!Number.isFinite(rounded) || !Number.isSafeInteger(Math.round(rounded * 100))) return null;
+  return rounded;
 };
 
 const isPlainObject = (value: any): boolean => {
@@ -142,6 +147,15 @@ const extractStudentsFromClass = (classData: any): any[] => {
 const parseCalendarDate = (rawDate: any): Date | null => {
   if (rawDate === null || rawDate === undefined || rawDate === '') return null;
 
+  const makeValidatedLocalDate = (year: number, monthIndex: number, day: number): Date | null => {
+    if (!Number.isInteger(year) || !Number.isInteger(monthIndex) || !Number.isInteger(day) ||
+        monthIndex < 0 || monthIndex > 11 || day < 1 || day > 31) return null;
+    const result = new Date(year, monthIndex, day);
+    return result.getFullYear() === year && result.getMonth() === monthIndex && result.getDate() === day
+      ? result
+      : null;
+  };
+
   try {
     if (rawDate instanceof Date) {
       return Number.isNaN(rawDate.getTime()) ? null : rawDate;
@@ -164,16 +178,16 @@ const parseCalendarDate = (rawDate: any): Date | null => {
     // Date-only strings represent a calendar date, not midnight UTC.
     const isoDateOnly = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
     if (isoDateOnly) {
-      const converted = new Date(Number(isoDateOnly[1]), Number(isoDateOnly[2]) - 1, Number(isoDateOnly[3]));
-      return Number.isNaN(converted.getTime()) ? null : converted;
+      return makeValidatedLocalDate(Number(isoDateOnly[1]), Number(isoDateOnly[2]) - 1, Number(isoDateOnly[3]));
     }
     // Existing Departments data also accepts MM/DD/YYYY.
     const slashDate = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
     if (slashDate) {
-      const converted = new Date(Number(slashDate[3]), Number(slashDate[1]) - 1, Number(slashDate[2]));
-      return Number.isNaN(converted.getTime()) ? null : converted;
+      return makeValidatedLocalDate(Number(slashDate[3]), Number(slashDate[1]) - 1, Number(slashDate[2]));
     }
 
+    const datePrefix = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[Tt ]|Z$)/);
+    if (datePrefix && !makeValidatedLocalDate(Number(datePrefix[1]), Number(datePrefix[2]) - 1, Number(datePrefix[3]))) return null;
     const converted = new Date(value);
     return Number.isNaN(converted.getTime()) ? null : converted;
   } catch {
@@ -535,12 +549,22 @@ const createPaymentIdempotencyKey = async (basis: string): Promise<string> => {
   return `payment_${encoded}`;
 };
 
+const normalizeFirebaseErrorCode = (rawCode: unknown): string =>
+  String(rawCode ?? '').trim().toLowerCase().replace(/^(?:firestore|firebase|auth)\//, '');
+
 const getFriendlyErrorMessage = (error: any): string => {
-  if (error?.code === 'permission-denied') return 'Permission denied. Verify the teacher account and Firestore Security Rules.';
-  if (error?.code === 'unauthenticated') return 'Your session has expired. Sign in again and retry.';
-  if (error instanceof Error && /malformed|invalid|does not match|missing|access denied|teacher session changed|no longer exists|no longer belongs/i.test(error.message)) return error.message;
-  if (error instanceof Error && /overpay|exceeds outstanding|no outstanding dues/i.test(error.message)) return error.message;
-  return 'Unable to save the fee record. No partial save was accepted; check your connection and retry.';
+  const code = normalizeFirebaseErrorCode(error?.code);
+  const message = error instanceof Error ? error.message : String(error?.message ?? '');
+  if (!code && /malformed|invalid|does not match|missing|access denied|teacher session changed|no longer exists|no longer belongs|no payment was saved|reconcile|overpay|exceeds outstanding|no outstanding dues|payment history|changed after confirmation|differs from the confirmed estimate/i.test(message)) return message;
+  if (code === 'permission-denied') return 'Permission denied. Verify the signed-in teacher profile and Firestore Security Rules. No unconfirmed payment should be retried with a new amount.';
+  if (code === 'unauthenticated' || code === 'user-token-expired' || code === 'invalid-user-token') return 'Your session has expired. Sign in again, then reopen the payment form.';
+  if (['unavailable', 'deadline-exceeded', 'network-request-failed', 'cancelled', 'internal'].includes(code)) return 'Firebase could not confirm the operation because the service or connection is unavailable. Keep the same payment amount and retry to reconcile the result.';
+  if (code === 'aborted') return 'The record changed concurrently and Firestore could not complete the transaction. Refresh the fee data and retry after reviewing the balance.';
+  if (code === 'resource-exhausted') return 'Firestore rejected the operation because a service quota or request limit was reached. No new attempt should be made until the cause is resolved.';
+  if (code === 'failed-precondition') return 'Firestore rejected the operation because a required precondition or configuration is not satisfied. Inspect the full console error; if it requests an index, deploy that index and retry.';
+  if (code === 'invalid-argument') return 'Firestore rejected the request as invalid. Check the fee data and submitted values before retrying.';
+  if (code === 'not-found') return 'A required fee, class, or teacher record could not be found. Refresh the selected class/month and verify the data.';
+  return 'Unable to confirm the fee operation. Review the diagnostic details in the console; if the outcome is uncertain, retry only the same payment amount.';
 };
 
 interface PaymentOperationContext {
@@ -554,6 +578,445 @@ interface PaymentOperationContext {
   outcomeUncertain?: boolean;
 }
 
+
+type FeeReportScope = 'selected' | 'history' | 'range';
+type FeeReportAction = 'download' | 'print';
+
+interface FeeReportStudentRow {
+  serial: number;
+  rollNo: string;
+  studentName: string;
+  studentId: string;
+  gender: string;
+  month: string;
+  assessedFee: number | null;
+  previousDues: number | null;
+  totalPayable: number | null;
+  amountPaid: number | null;
+  remainingBalance: number | null;
+  status: string;
+  latestPaymentDate: string;
+  legacyAggregate: boolean;
+}
+
+interface FeeReportTransaction {
+  paymentDate: string;
+  createdAtDate: Date | null;
+  paymentId: string;
+  studentName: string;
+  studentId: string;
+  feeMonth: string;
+  amount: number | null;
+  appliedToPreviousDues: number | null;
+  appliedToCurrentMonth: number | null;
+  source: string;
+}
+
+interface FeeReportMonth {
+  month: string;
+  hasDocument: boolean;
+  rows: FeeReportStudentRow[];
+  assessedTotal: number | null;
+  paidCount: number;
+  partialCount: number;
+  unpaidCount: number;
+  unrecordedCount: number;
+  previousDuesTotal: number | null;
+  collectedByFeeMonth: number | null;
+  outstandingTotal: number | null;
+}
+
+interface FeeReportModel {
+  title: string;
+  className: string;
+  classId: string;
+  teacherEmail: string;
+  scope: FeeReportScope;
+  periodLabel: string;
+  generatedAt: string;
+  months: FeeReportMonth[];
+  transactions: FeeReportTransaction[];
+  warnings: string[];
+  isComplete: boolean;
+  totals: {
+    eligibleStudents: number;
+    paidCount: number;
+    partialCount: number;
+    unpaidCount: number;
+    unrecordedCount: number;
+    assessedFees: number | null;
+    collectionsReceivedDuringPeriod: number | null;
+    legacyAggregateForPeriod: number | null;
+    cumulativeRecordedPayments: number | null;
+    previousDuesAtEnd: number | null;
+    outstandingAtEnd: number | null;
+  };
+}
+
+const MAX_FEE_REPORT_MONTHS = 600;
+const MAX_FEE_REPORT_RECEIPTS_PER_MONTH = 10000;
+const MAX_FEE_REPORT_RECEIPTS_TOTAL = 100000;
+const MAX_FEE_REPORT_WARNINGS = 80;
+
+const formatPKR = (value: number | null | undefined): string =>
+  value === null || value === undefined || !Number.isFinite(value)
+    ? 'N/A'
+    : `PKR ${roundMoney(value).toLocaleString('en-PK', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+const formatMonthLabel = (monthKey: string): string => {
+  if (!isValidMonthKey(monthKey)) return monthKey;
+  const [year, month] = monthKey.split('-').map(Number);
+  return new Date(year, month - 1, 1).toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+};
+
+const getMonthsBetween = (startMonth: string, endMonth: string): string[] => {
+  if (!isValidMonthKey(startMonth) || !isValidMonthKey(endMonth) || startMonth > endMonth) {
+    throw new Error('Choose a valid starting month that is not later than the ending month.');
+  }
+  const [startYear, startNumber] = startMonth.split('-').map(Number);
+  const [endYear, endNumber] = endMonth.split('-').map(Number);
+  const count = (endYear - startYear) * 12 + endNumber - startNumber + 1;
+  if (count < 1 || count > MAX_FEE_REPORT_MONTHS) {
+    throw new Error(`A report can cover up to ${MAX_FEE_REPORT_MONTHS} months at a time. Choose a narrower range.`);
+  }
+  return Array.from({ length: count }, (_, index) => getMonthOffset(startMonth, index));
+};
+
+const sanitizeReportFilePart = (value: string): string => {
+  const sanitized = value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '-')
+    .replace(/\s+/g, '_')
+    .replace(/[^A-Za-z0-9._-]/g, '')
+    .replace(/^[._-]+|[._-]+$/g, '')
+    .slice(0, 60);
+  return sanitized || 'Class';
+};
+
+const reportFilename = (model: FeeReportModel): string => {
+  const classPart = sanitizeReportFilePart(model.className);
+  const classWithPrefix = /^class/i.test(classPart) ? classPart : `Class${classPart}`;
+  const first = model.months[0]?.month || getCurrentMonthKey();
+  const last = model.months[model.months.length - 1]?.month || first;
+  const period = first === last ? first : `${first}_to_${last}`;
+  return `EduTrack_Fee_Report_${classWithPrefix}_${period}.pdf`;
+};
+
+const escapeHtml = (value: unknown): string => String(value ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+
+const reportHtml = (model: FeeReportModel): string => {
+  const fmt = (value: number | null | undefined) => escapeHtml(formatPKR(value));
+  const ledgerRows = model.months.flatMap((month) => month.rows).map((row) => `
+    <tr>
+      <td>${row.serial}</td><td>${escapeHtml(row.rollNo)}</td><td>${escapeHtml(row.studentName)}</td>
+      <td>${escapeHtml(row.studentId)}</td><td>${escapeHtml(row.gender)}</td><td>${escapeHtml(formatMonthLabel(row.month))}</td>
+      <td class="money">${fmt(row.assessedFee)}</td><td class="money">${fmt(row.previousDues)}</td>
+      <td class="money">${fmt(row.totalPayable)}</td><td class="money">${fmt(row.amountPaid)}</td>
+      <td class="money">${fmt(row.remainingBalance)}</td><td class="status ${row.status.toLowerCase().replace(/[^a-z]/g, '')}">${escapeHtml(row.status)}</td>
+      <td>${escapeHtml(row.latestPaymentDate)}</td>
+    </tr>`).join('');
+  const monthRows = model.months.map((month) => `
+    <tr><td>${escapeHtml(formatMonthLabel(month.month))}</td><td>${month.hasDocument ? 'Available' : 'Missing record'}</td>
+    <td>${month.rows.length}</td><td>${month.paidCount}</td><td>${month.partialCount}</td><td>${month.unpaidCount}</td>
+    <td>${month.unrecordedCount}</td><td class="money">${fmt(month.assessedTotal)}</td>
+    <td class="money">${fmt(month.collectedByFeeMonth)}</td><td class="money">${fmt(month.previousDuesTotal)}</td>
+    <td class="money">${fmt(month.outstandingTotal)}</td></tr>`).join('');
+  const transactionRows = model.transactions.map((item) => `
+    <tr><td>${escapeHtml(item.paymentDate)}</td><td>${escapeHtml(item.paymentId)}</td><td>${escapeHtml(item.studentName)}</td>
+    <td>${escapeHtml(item.studentId)}</td><td>${escapeHtml(formatMonthLabel(item.feeMonth))}</td><td class="money">${fmt(item.amount)}</td>
+    <td class="money">${fmt(item.appliedToPreviousDues)}</td><td class="money">${fmt(item.appliedToCurrentMonth)}</td><td>${escapeHtml(item.source)}</td></tr>`).join('');
+  const warnings = model.warnings.length
+    ? `<section class="warnings"><h2>Data quality notes</h2><ul>${model.warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></section>`
+    : '<p class="verified">No data-quality gaps were detected in the queried records.</p>';
+  const summary = [
+    ['Students at period end', String(model.totals.eligibleStudents)],
+    ['Paid at period end', String(model.totals.paidCount)],
+    ['Partial at period end', String(model.totals.partialCount)],
+    ['Unpaid at period end', String(model.totals.unpaidCount)],
+    ['Assessed fees in period', fmt(model.totals.assessedFees)],
+    ['Dated receipts received in period', fmt(model.totals.collectionsReceivedDuringPeriod)],
+    ['Legacy aggregates attributed by fee month', fmt(model.totals.legacyAggregateForPeriod)],
+    ['Cumulative recorded payments', fmt(model.totals.cumulativeRecordedPayments)],
+    ['Previous dues at period end', fmt(model.totals.previousDuesAtEnd)],
+    ['Outstanding balance at period end', fmt(model.totals.outstandingAtEnd)]
+  ].map(([label, value]) => `<div class="metric"><span>${escapeHtml(label)}</span><strong>${value}</strong></div>`).join('');
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${escapeHtml(model.title)}</title><style>
+    @page{size:A4 landscape;margin:12mm}*{box-sizing:border-box}body{font:10px Arial,Helvetica,sans-serif;color:#172033;margin:0}
+    header{background:#111827;color:white;padding:18px 22px;border-bottom:5px solid #f59e0b;margin-bottom:14px}
+    .brand{font-size:19px;font-weight:800;letter-spacing:.2px}.brand span{color:#fbbf24}h1{font-size:17px;margin:8px 0 4px}header p{margin:3px 0;color:#e5e7eb}
+    h2{font-size:13px;color:#c65d0b;margin:18px 0 7px;border-bottom:1px solid #f3b56a;padding-bottom:5px}
+    .metrics{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:7px;margin:8px 0 14px}.metric{border:1px solid #e5e7eb;border-radius:7px;padding:8px;background:#fafafa;break-inside:avoid}
+    .metric span{display:block;color:#64748b;font-size:8px;margin-bottom:5px}.metric strong{font-size:11px}.tag{display:inline-block;border:1px solid #d97706;color:#9a3412;background:#fff7ed;border-radius:100px;padding:3px 8px;font-weight:700}
+    table{border-collapse:collapse;width:100%;font-size:7px;table-layout:auto;margin:6px 0 14px}thead{display:table-header-group}tr{break-inside:avoid}th{background:#fff0d6;color:#7c2d12;text-align:left;font-weight:700}th,td{border:1px solid #e5e7eb;padding:5px 4px;vertical-align:top}td.money{text-align:right;white-space:nowrap}td.status{font-weight:700}.paid{color:#047857}.partial{color:#b45309}.unpaid{color:#be123c}.notrecorded{color:#64748b}
+    .warnings{border-left:4px solid #d97706;background:#fff7ed;padding:8px 12px;margin-top:16px}.warnings li{margin:4px 0}.verified{color:#047857}.note{margin-top:18px;padding-top:7px;border-top:1px solid #cbd5e1;color:#64748b;font-size:8px}
+    footer{margin-top:12px;color:#64748b;font-size:8px;border-top:1px solid #cbd5e1;padding-top:6px}@media print{body{-webkit-print-color-adjust:exact;print-color-adjust:exact}}
+  </style></head><body><header><div class="brand">Edu<span>Track</span></div><h1>${escapeHtml(model.title)}</h1>
+    <p>Class: ${escapeHtml(model.className)} &nbsp; | &nbsp; Class ID: ${escapeHtml(model.classId)}</p>
+    <p>Teacher: ${escapeHtml(model.teacherEmail)} &nbsp; | &nbsp; Period: ${escapeHtml(model.periodLabel)} &nbsp; | &nbsp; Currency: PKR</p>
+    <p>Generated: ${escapeHtml(model.generatedAt)} &nbsp; | &nbsp; Report scope: ${escapeHtml(model.scope === 'selected' ? 'Selected month' : model.scope === 'history' ? 'Available class history' : 'Custom month range')}</p>
+    ${model.isComplete ? '<span class="tag">Queried records reconciled</span>' : '<span class="tag">Data gaps or legacy details present</span>'}</header>
+    <h2>Financial summary</h2><div class="metrics">${summary}</div>
+    <h2>Month-by-month assessment and balance</h2><table><thead><tr><th>Fee month</th><th>Record</th><th>Students</th><th>Paid</th><th>Partial</th><th>Unpaid</th><th>Unrecorded</th><th>Assessed fees</th><th>Recorded collection</th><th>Previous dues</th><th>Outstanding</th></tr></thead><tbody>${monthRows || '<tr><td colspan="11">No monthly ledger records are available.</td></tr>'}</tbody></table>
+    <h2>Student ledger</h2><p>Amounts marked N/A were not verifiable from the stored historical records. Each row represents one student and fee month.</p>
+    <table><thead><tr><th>#</th><th>Roll no.</th><th>Student name</th><th>Student ID</th><th>Gender</th><th>Fee month</th><th>Assessed fee</th><th>Previous dues</th><th>Total payable</th><th>Amount paid</th><th>Remaining balance</th><th>Status</th><th>Latest payment date</th></tr></thead><tbody>${ledgerRows || '<tr><td colspan="13">No student ledger rows are available.</td></tr>'}</tbody></table>
+    <h2>Detailed transaction ledger</h2><table><thead><tr><th>Payment date/time</th><th>Receipt / payment ID</th><th>Student name</th><th>Student ID</th><th>Fee month</th><th>Amount received</th><th>Applied to previous dues</th><th>Applied to current month</th><th>Source</th></tr></thead><tbody>${transactionRows || '<tr><td colspan="9">No verifiable detailed receipts were found in the queried report scope.</td></tr>'}</tbody></table>
+    ${warnings}<p class="note">Confidential student financial information. Share only with authorized recipients. Figures are limited to records available and readable in the authenticated teacher account; N/A indicates an unavailable or unverifiable value.</p>
+    <footer>EduTrack · ${escapeHtml(model.className)} · ${escapeHtml(model.periodLabel)} · ${model.isComplete ? 'Queried records reconciled' : 'Data quality limitations identified'}</footer></body></html>`;
+};
+
+const pdfWinAnsiByte = (char: string): number | null => {
+  const code = char.codePointAt(0) ?? 63;
+  if (code >= 32 && code <= 126) return code;
+  if (code >= 160 && code <= 255) return code;
+  const special: Record<number, number> = {
+    0x20ac: 0x80, 0x201a: 0x82, 0x0192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86,
+    0x2021: 0x87, 0x02c6: 0x88, 0x2030: 0x89, 0x0160: 0x8a, 0x2039: 0x8b, 0x0152: 0x8c,
+    0x017d: 0x8e, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95,
+    0x2013: 0x96, 0x2014: 0x97, 0x02dc: 0x98, 0x2122: 0x99, 0x0161: 0x9a, 0x203a: 0x9b,
+    0x0153: 0x9c, 0x017e: 0x9e, 0x0178: 0x9f
+  };
+  return special[code] ?? null;
+};
+
+const pdfLiteral = (value: unknown): string => {
+  const input = String(value ?? '');
+  let result = '';
+  for (const char of input) {
+    const byte = pdfWinAnsiByte(char);
+    if (byte === null) { result += '?'; continue; }
+    if (byte === 40 || byte === 41 || byte === 92) result += `\\${String.fromCharCode(byte)}`;
+    else if (byte < 32 || byte > 126) result += `\\${byte.toString(8).padStart(3, '0')}`;
+    else result += String.fromCharCode(byte);
+  }
+  return result;
+};
+
+const buildFeeReportPdf = (model: FeeReportModel): Uint8Array => {
+  const pageWidth = 842;
+  const pageHeight = 595;
+  const margin = 28;
+  const pages: string[][] = [];
+  let commands: string[] = [];
+  let y = 0;
+  const color = (r: number, g: number, b: number) => `${r.toFixed(3)} ${g.toFixed(3)} ${b.toFixed(3)}`;
+  const drawRect = (x: number, top: number, width: number, height: number, fill: string, stroke?: string) => {
+    const base = pageHeight - top - height;
+    commands.push(`${fill} rg ${x} ${base} ${width} ${height} re f`);
+    if (stroke) commands.push(`${stroke} RG 0.6 w ${x} ${base} ${width} ${height} re S`);
+  };
+  const drawText = (x: number, top: number, value: unknown, size = 8, bold = false, fill = color(0.12, 0.16, 0.22)) => {
+    commands.push(`BT /${bold ? 'F2' : 'F1'} ${size} Tf ${fill} rg 1 0 0 1 ${x.toFixed(2)} ${(pageHeight - top - size).toFixed(2)} Tm (${pdfLiteral(value)}) Tj ET`);
+  };
+  const newPage = (sectionTitle: string) => {
+    commands = [];
+    pages.push(commands);
+    drawRect(0, 0, pageWidth, 76, color(0.07, 0.10, 0.16));
+    drawRect(0, 73, pageWidth, 3, color(0.96, 0.56, 0.10));
+    drawText(margin, 17, 'EduTrack', 16, true, color(1, 1, 1));
+    drawText(margin, 39, model.title, 12, true, color(1, 1, 1));
+    drawText(450, 19, `Class: ${model.className}  |  ID: ${model.classId}`, 8, true, color(1, 0.78, 0.43));
+    drawText(450, 34, `Period: ${model.periodLabel}`, 8, false, color(0.90, 0.92, 0.95));
+    drawText(450, 49, `Teacher: ${model.teacherEmail}  |  Currency: PKR`, 7, false, color(0.90, 0.92, 0.95));
+    drawText(450, 61, `Generated: ${model.generatedAt}`, 6.5, false, color(0.90, 0.92, 0.95));
+    drawText(margin, 88, sectionTitle, 10, true, color(0.75, 0.29, 0.04));
+    y = 105;
+  };
+  const ensureSpace = (height: number, sectionTitle: string, repeat?: () => void) => {
+    if (y + height <= pageHeight - 39) return;
+    newPage(sectionTitle);
+    if (repeat) repeat();
+  };
+  const drawSectionHeading = (label: string) => {
+    ensureSpace(24, label);
+    drawText(margin, y, label, 9, true, color(0.75, 0.29, 0.04));
+    drawRect(margin, y + 14, pageWidth - margin * 2, 1, color(0.95, 0.70, 0.39));
+    y += 22;
+  };
+  interface PdfColumn { key: string; label: string; width: number; align?: 'left' | 'right' }
+  const drawTable = (title: string, columns: PdfColumn[], rows: Array<Record<string, unknown>>) => {
+    const tableWidth = columns.reduce((sum, column) => sum + column.width, 0);
+    if (tableWidth > pageWidth - margin * 2 + 0.1) throw new Error(`Internal PDF layout error: ${title} table exceeds page width.`);
+    const header = () => {
+      drawRect(margin, y, tableWidth, 21, color(1, 0.94, 0.84));
+      let x = margin;
+      columns.forEach((column) => {
+        drawText(x + 3, y + 6, column.label, 6.2, true, color(0.43, 0.16, 0.06));
+        x += column.width;
+      });
+      y += 21;
+    };
+    ensureSpace(25, title);
+    drawSectionHeading(title);
+    header();
+    const wrapCell = (value: unknown, width: number): string[] => {
+      const raw = String(value ?? 'N/A');
+      const maxChars = Math.max(4, Math.floor((width - 6) / 2.9));
+      if (!raw.length) return [''];
+      const words = raw.split(/\s+/);
+      const lines: string[] = [];
+      let line = '';
+      words.forEach((word) => {
+        if (word.length > maxChars) {
+          if (line) { lines.push(line); line = ''; }
+          for (let offset = 0; offset < word.length; offset += maxChars) lines.push(word.slice(offset, offset + maxChars));
+          return;
+        }
+        if (!line) line = word;
+        else if (`${line} ${word}`.length <= maxChars) line += ` ${word}`;
+        else { lines.push(line); line = word; }
+      });
+      if (line) lines.push(line);
+      return lines.length ? lines : [''];
+    };
+    rows.forEach((row, rowIndex) => {
+      const cellLines = columns.map((column) => wrapCell(row[column.key], column.width));
+      const rowHeight = Math.max(18, Math.max(...cellLines.map((lines) => lines.length)) * 8 + 6);
+      if (y + rowHeight > pageHeight - 39) {
+        newPage(title);
+        drawText(margin, y, `${title} (continued)`, 8, true, color(0.75, 0.29, 0.04));
+        y += 13;
+        header();
+      }
+      if (rowIndex % 2 === 1) drawRect(margin, y, tableWidth, rowHeight, color(0.975, 0.978, 0.982));
+      let x = margin;
+      columns.forEach((column, columnIndex) => {
+        const raw = String(row[column.key] ?? 'N/A');
+        const fill = column.key === 'status'
+          ? (/partial/i.test(raw) ? color(0.70, 0.39, 0.03)
+            : /unpaid/i.test(raw) ? color(0.72, 0.12, 0.17)
+              : /paid/i.test(raw) ? color(0.02, 0.45, 0.31) : color(0.16, 0.20, 0.26))
+          : color(0.16, 0.20, 0.26);
+        cellLines[columnIndex].forEach((line, lineIndex) => {
+          drawText(x + 3, y + 3 + lineIndex * 8, line, 5.6, column.key === 'status', fill);
+        });
+        x += column.width;
+      });
+      y += rowHeight;
+      commands.push(`${color(0.87, 0.89, 0.92)} RG 0.25 w ${margin} ${pageHeight - y} m ${margin + tableWidth} ${pageHeight - y} l S`);
+    });
+    y += 10;
+  };
+
+  newPage('Financial summary');
+  const metricItems: Array<[string, string]> = [
+    ['Students at period end', String(model.totals.eligibleStudents)],
+    ['Paid', String(model.totals.paidCount)],
+    ['Partial', String(model.totals.partialCount)],
+    ['Unpaid', String(model.totals.unpaidCount)],
+    ['Unrecorded status', String(model.totals.unrecordedCount)],
+    ['Assessed fees in period', formatPKR(model.totals.assessedFees)],
+    ['Dated receipts received in period', formatPKR(model.totals.collectionsReceivedDuringPeriod)],
+    ['Legacy aggregates by fee month', formatPKR(model.totals.legacyAggregateForPeriod)],
+    ['Cumulative recorded payments', formatPKR(model.totals.cumulativeRecordedPayments)],
+    ['Previous dues at end', formatPKR(model.totals.previousDuesAtEnd)],
+    ['Outstanding balance at end', formatPKR(model.totals.outstandingAtEnd)]
+  ];
+  const metricGap = 8;
+  const metricWidth = (pageWidth - margin * 2 - metricGap * 3) / 4;
+  metricItems.forEach(([label, value], index) => {
+    const row = Math.floor(index / 4);
+    const col = index % 4;
+    const boxX = margin + col * (metricWidth + metricGap);
+    const boxTop = y + row * 46;
+    drawRect(boxX, boxTop, metricWidth, 39, color(0.975, 0.978, 0.982), color(0.88, 0.90, 0.93));
+    drawText(boxX + 7, boxTop + 7, label, 6.2, false, color(0.39, 0.43, 0.49));
+    drawText(boxX + 7, boxTop + 21, value, 8.1, true, color(0.08, 0.12, 0.19));
+  });
+  y += Math.ceil(metricItems.length / 4) * 46 + 8;
+  drawText(margin, y, model.isComplete ? 'Queried records reconciled; see ledger for monthly detail.' : 'DATA LIMITATIONS DETECTED — this report does not claim a complete historical ledger.', 7, true, model.isComplete ? color(0.02, 0.45, 0.31) : color(0.72, 0.24, 0.02));
+  y += 20;
+
+  drawTable('Month-by-month assessments and balances', [
+    { key: 'month', label: 'Fee month', width: 78 }, { key: 'record', label: 'Record', width: 62 },
+    { key: 'students', label: 'Students', width: 43 }, { key: 'paid', label: 'Paid', width: 35 },
+    { key: 'partial', label: 'Partial', width: 39 }, { key: 'unpaid', label: 'Unpaid', width: 39 },
+    { key: 'unknown', label: 'Unrecorded', width: 55 }, { key: 'assessed', label: 'Assessed fees', width: 74 },
+    { key: 'collected', label: 'Recorded collection', width: 87 }, { key: 'previous', label: 'Previous dues', width: 72 },
+    { key: 'outstanding', label: 'Outstanding', width: 75 }
+  ], model.months.map((month) => ({
+    month: formatMonthLabel(month.month), record: month.hasDocument ? 'Available' : 'Missing', students: month.rows.length,
+    paid: month.paidCount, partial: month.partialCount, unpaid: month.unpaidCount, unknown: month.unrecordedCount,
+    assessed: formatPKR(month.assessedTotal), collected: formatPKR(month.collectedByFeeMonth),
+    previous: formatPKR(month.previousDuesTotal), outstanding: formatPKR(month.outstandingTotal)
+  })));
+
+  drawTable('Student ledger', [
+    { key: 'serial', label: '#', width: 22 }, { key: 'rollNo', label: 'Roll no.', width: 46 },
+    { key: 'studentName', label: 'Student name', width: 102 }, { key: 'studentId', label: 'Student ID', width: 66 },
+    { key: 'gender', label: 'Gender', width: 38 }, { key: 'month', label: 'Fee month', width: 56 },
+    { key: 'assessed', label: 'Assessed', width: 60 }, { key: 'previous', label: 'Prev. dues', width: 58 },
+    { key: 'payable', label: 'Payable', width: 58 }, { key: 'paid', label: 'Paid', width: 58 },
+    { key: 'balance', label: 'Balance', width: 59 }, { key: 'status', label: 'Status', width: 48 },
+    { key: 'latest', label: 'Latest pay date', width: 81 }
+  ], model.months.flatMap((month) => month.rows.map((row) => ({
+    serial: row.serial, rollNo: row.rollNo, studentName: row.studentName, studentId: row.studentId,
+    gender: row.gender, month: formatMonthLabel(row.month), assessed: formatPKR(row.assessedFee),
+    previous: formatPKR(row.previousDues), payable: formatPKR(row.totalPayable), paid: formatPKR(row.amountPaid),
+    balance: formatPKR(row.remainingBalance), status: row.status, latest: row.latestPaymentDate
+  }))));
+
+  drawTable('Detailed transaction ledger', [
+    { key: 'date', label: 'Payment date/time', width: 92 }, { key: 'id', label: 'Receipt / payment ID', width: 104 },
+    { key: 'name', label: 'Student name', width: 106 }, { key: 'studentId', label: 'Student ID', width: 68 },
+    { key: 'month', label: 'Fee month', width: 72 }, { key: 'amount', label: 'Received', width: 65 },
+    { key: 'previous', label: 'To previous dues', width: 78 }, { key: 'current', label: 'To current fee', width: 74 },
+    { key: 'source', label: 'Source', width: 74 }
+  ], model.transactions.map((item) => ({
+    date: item.paymentDate, id: item.paymentId, name: item.studentName, studentId: item.studentId,
+    month: formatMonthLabel(item.feeMonth), amount: formatPKR(item.amount),
+    previous: formatPKR(item.appliedToPreviousDues), current: formatPKR(item.appliedToCurrentMonth), source: item.source
+  })));
+
+  if (model.warnings.length) {
+    drawSectionHeading('Data quality notes');
+    model.warnings.forEach((warning, index) => {
+      ensureSpace(22, 'Data quality notes');
+      drawText(margin + 3, y, `${index + 1}. ${warning}`, 6.7, false, color(0.42, 0.24, 0.12));
+      y += 13;
+    });
+  } else {
+    drawText(margin, y, 'No data-quality gaps were detected in the queried records.', 7, true, color(0.02, 0.45, 0.31));
+    y += 12;
+  }
+
+  pages.forEach((pageCommands, index) => {
+    pageCommands.push(`${color(0.75, 0.78, 0.82)} RG 0.5 w ${margin} 27 m ${pageWidth - margin} 27 l S`);
+    const footerLeft = `Confidential student financial data  |  ${model.className}  |  ${model.periodLabel}`;
+    pageCommands.push(`BT /F1 6 Tf ${color(0.38, 0.42, 0.48)} rg 1 0 0 1 ${margin} 15 Tm (${pdfLiteral(footerLeft)}) Tj ET`);
+    pageCommands.push(`BT /F2 6 Tf ${color(0.38, 0.42, 0.48)} rg 1 0 0 1 ${pageWidth - margin - 64} 15 Tm (Page ${index + 1} of ${pages.length}) Tj ET`);
+  });
+
+  const objects: string[] = [];
+  const addObject = (value: string) => { objects.push(value); return objects.length; };
+  addObject(''); // 1: catalog placeholder
+  addObject(''); // 2: pages placeholder
+  addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>'); // 3
+  addObject('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>'); // 4
+  const pageIds: number[] = [];
+  pages.forEach((pageCommands) => {
+    const content = pageCommands.join('\n');
+    const contentId = addObject(`<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
+    const pageId = addObject(`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageWidth} ${pageHeight}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents ${contentId} 0 R >>`);
+    pageIds.push(pageId);
+  });
+  objects[0] = '<< /Type /Catalog /Pages 2 0 R >>';
+  objects[1] = `<< /Type /Pages /Kids [${pageIds.map((id) => `${id} 0 R`).join(' ')}] /Count ${pageIds.length} >>`;
+  let pdf = '%PDF-1.4\n% EduTrack report\n';
+  const offsets: number[] = [0];
+  objects.forEach((object, index) => {
+    offsets.push(pdf.length);
+    pdf += `${index + 1} 0 obj\n${object}\nendobj\n`;
+  });
+  const xrefOffset = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let index = 1; index < offsets.length; index += 1) pdf += `${String(offsets[index]).padStart(10, '0')} 00000 n \n`;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
+  return new TextEncoder().encode(pdf);
+};
+
 export default function Fees() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -563,8 +1026,19 @@ export default function Fees() {
   const [classes, setClasses] = useState<any[]>([]);
   const [selectedClassId, setSelectedClassId] = useState('');
   const [feeMap, setFeeMap] = useState<Record<string, StudentFeeRecord>>({});
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingClasses, setIsLoadingClasses] = useState(false);
+  const [classDataStatus, setClassDataStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [classRetryCount, setClassRetryCount] = useState(0);
+  const [authRetryCount, setAuthRetryCount] = useState(0);
+  const [feeDataStatus, setFeeDataStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [feeDataError, setFeeDataError] = useState<string | null>(null);
+  const [feeRetryCount, setFeeRetryCount] = useState(0);
   const [hasPrevMonthRecords, setHasPrevMonthRecords] = useState(false);
+  const [notification, setNotification] = useState<{ kind: 'success' | 'error' | 'warning' | 'info'; message: string } | null>(null);
+  const notificationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [bulkConfirmation, setBulkConfirmation] = useState<{ action: 'paid' | 'unpaid'; classId: string; className: string; month: string; studentIds: string[]; estimatedTotal: number; studentCount: number } | null>(null);
+  const [isBulkProcessing, setIsBulkProcessing] = useState(false);
+  const [isPaymentSaving, setIsPaymentSaving] = useState(false);
 
   const [isClassModalOpen, setIsClassModalOpen] = useState(false);
   const [isMonthModalOpen, setIsMonthModalOpen] = useState(false);
@@ -574,6 +1048,12 @@ export default function Fees() {
   const [genderFilter, setGenderFilter] = useState<'ALL' | 'Male' | 'Female'>('ALL');
   const [currentPage, setCurrentPage] = useState(1);
   const ITEMS_PER_PAGE = 10;
+
+  const showNotification = useCallback((kind: 'success' | 'error' | 'warning' | 'info', message: string) => {
+    setNotification((current) => current?.kind === kind && current.message === message ? current : { kind, message });
+    if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
+    notificationTimerRef.current = setTimeout(() => { setNotification(null); notificationTimerRef.current = null; }, kind === 'error' ? 6500 : 4000);
+  }, []);
 
   const [activeModalStudent, setActiveModalStudent] = useState<any | null>(null);
   const [modalPaidInput, setModalPaidInput] = useState<string>('');
@@ -612,6 +1092,18 @@ export default function Fees() {
   }, [currentClass.students, hasPrevMonthRecords]);
 
   const [selectedMonth, setSelectedMonth] = useState<string>(() => getCurrentMonthKey());
+  const [isReportModalOpen, setIsReportModalOpen] = useState(false);
+  const [reportScope, setReportScope] = useState<FeeReportScope>('selected');
+  const [reportStartMonth, setReportStartMonth] = useState<string>(() => getCurrentMonthKey());
+  const [reportEndMonth, setReportEndMonth] = useState<string>(() => getCurrentMonthKey());
+  const [isReportGenerating, setIsReportGenerating] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
+  const [generatedReport, setGeneratedReport] = useState<{ model: FeeReportModel; blob: Blob; filename: string; signature: string } | null>(null);
+  const reportInFlightRef = useRef(false);
+
+  useEffect(() => {
+    setGeneratedReport(null);
+  }, [currentUserEmail, selectedClassId, selectedMonth, reportScope, reportStartMonth, reportEndMonth]);
 
   useEffect(() => {
     if (monthOptions.length > 0 && !monthOptions.some((month) => month.value === selectedMonth)) {
@@ -626,11 +1118,18 @@ export default function Fees() {
       if (!user || !user.email) {
         if (!active) return;
         setCurrentUserEmail(null);
+        setClassDataStatus('loading');
         setClasses([]);
         setSelectedClassId('');
         setFeeMap({});
+        setFeeDataStatus('loading');
+        setFeeDataError(null);
+        setBulkConfirmation(null);
         setHasPrevMonthRecords(false);
-        setIsLoading(false);
+        setIsReportModalOpen(false);
+        setGeneratedReport(null);
+        setReportError(null);
+        setIsLoadingClasses(false);
         setActiveModalStudent(null);
         paymentOperationRef.current = null;
         return;
@@ -638,13 +1137,20 @@ export default function Fees() {
 
       // Clear the prior tenant immediately, then verify this user's profile before listening to data.
       setCurrentUserEmail(null);
+      setClassDataStatus('loading');
       setClasses([]);
       setSelectedClassId('');
       setFeeMap({});
+      setFeeDataStatus('loading');
+      setFeeDataError(null);
+      setBulkConfirmation(null);
       setHasPrevMonthRecords(false);
+      setIsReportModalOpen(false);
+      setGeneratedReport(null);
+      setReportError(null);
       setActiveModalStudent(null);
       paymentOperationRef.current = null;
-      setIsLoading(true);
+      setIsLoadingClasses(true);
 
       try {
         const tenantEmail = normalizeTeacherEmail(user.email);
@@ -656,30 +1162,37 @@ export default function Fees() {
         console.error('Unable to verify the current teacher session:', error);
         if (!active) return;
         setCurrentUserEmail(null);
+        setClassDataStatus('loading');
         setClasses([]);
         setSelectedClassId('');
         setFeeMap({});
-        setIsLoading(false);
+        setClassDataStatus('error');
+        setFeeDataStatus('error');
+        setFeeDataError(getFriendlyErrorMessage(error));
+        setIsLoadingClasses(false);
+        showNotification('error', `Teacher verification failed. ${getFriendlyErrorMessage(error)}`);
       }
     });
     return () => {
       active = false;
       unsubscribe();
     };
-  }, []);
+  }, [showNotification, authRetryCount]);
 
   // Subscribe only to the teacher's own classes collection. No UID/global fallbacks.
   useEffect(() => {
     if (!currentUserEmail || !hasAuthenticatedTenantSession(currentUserEmail)) {
+      setClassDataStatus('loading');
       setClasses([]);
       setSelectedClassId('');
       setFeeMap({});
-      setIsLoading(false);
+      setIsLoadingClasses(false);
       return;
     }
 
     let active = true;
-    setIsLoading(true);
+    setIsLoadingClasses(true);
+    setClassDataStatus('loading');
     const classesRef = collection(db, 'users', currentUserEmail, 'classes');
     const unsubscribe = onSnapshot(classesRef, (snapshot) => {
       if (!active) return;
@@ -698,26 +1211,31 @@ export default function Fees() {
         (a.name || '').localeCompare(b.name || '', undefined, { numeric: true, sensitivity: 'base' })
       );
       setClasses(fetchedClasses);
+      setClassDataStatus('ready');
       setSelectedClassId((previous) =>
         previous && fetchedClasses.some((item) => item.id === previous)
           ? previous
           : (fetchedClasses[0]?.id || '')
       );
-      setIsLoading(false);
+      setIsLoadingClasses(false);
     }, (error) => {
       console.error('Error fetching this teacher\'s classes:', error);
       if (!active) return;
       setClasses([]);
       setSelectedClassId('');
       setFeeMap({});
-      setIsLoading(false);
+      setClassDataStatus('error');
+      setFeeDataStatus('error');
+      setFeeDataError(getFriendlyErrorMessage(error));
+      setIsLoadingClasses(false);
+      showNotification('error', `Class data could not be loaded. ${getFriendlyErrorMessage(error)}`);
     });
 
     return () => {
       active = false;
       unsubscribe();
     };
-  }, [currentUserEmail]);
+  }, [currentUserEmail, classRetryCount, showNotification]);
 
   // Keep month-picker availability anchored to the current calendar month, not the selected month.
   // This avoids the previous-month option disappearing while that option is selected.
@@ -779,22 +1297,26 @@ export default function Fees() {
       !hasAuthenticatedTenantSession(currentUserEmail)
     ) {
       setFeeMap({});
+      setFeeDataStatus('loading');
+      setFeeDataError(null);
       return;
     }
 
     let active = true;
     let gotCurrent = false;
     let gotPrevious = false;
+    let readFailed = false;
     let currentRecords: Record<string, any> = {};
     let previousRecords: Record<string, any> = {};
-    setIsLoading(true);
+    setFeeDataStatus('loading');
+    setFeeDataError(null);
 
     const previousMonth = getMonthOffset(selectedMonth, -1);
     const currentFeeRef = doc(db, 'users', currentUserEmail, 'fees', docKey);
     const previousFeeRef = doc(db, 'users', currentUserEmail, 'fees', `${selectedClassId}_${previousMonth}`);
 
     const recalculateFeeMap = () => {
-      if (!active || !gotCurrent || !gotPrevious) return;
+      if (!active || readFailed || !gotCurrent || !gotPrevious) return;
       try {
         const nextMap: Record<string, StudentFeeRecord> = {};
 
@@ -858,7 +1380,9 @@ export default function Fees() {
 
         if (!active) return;
         setFeeMap(nextMap);
-        setIsLoading(false);
+        setFeeDataStatus('ready');
+        setFeeDataError(null);
+        setNotification((current) => current && /fee data could not be verified|class data could not be loaded|teacher verification failed/i.test(current.message) ? null : current);
         notifiedReadErrorRef.current = null;
       } catch (error) {
         handleSnapshotError('student', error);
@@ -868,16 +1392,20 @@ export default function Fees() {
     const handleSnapshotError = (label: string, error: any) => {
       console.error(`Unable to read ${label} fee records:`, error);
       if (!active) return;
+      readFailed = true;
       setFeeMap({});
-      setIsLoading(false);
-      const errorKey = `${currentUserEmail}/${selectedClassId}/${selectedMonth}`;
+      setFeeDataStatus('error');
+      setFeeDataError(getFriendlyErrorMessage(error));
+      const errorKey = `${currentUserEmail}/${selectedClassId}/${selectedMonth}/${normalizeFirebaseErrorCode(error?.code)}/${error?.message ?? ''}`;
+      console.error('[Fees] Fee data verification failed:', { stage: label, code: error?.code, normalizedCode: normalizeFirebaseErrorCode(error?.code), message: error?.message, customData: error?.customData, error });
       if (notifiedReadErrorRef.current !== errorKey) {
         notifiedReadErrorRef.current = errorKey;
-        window.alert('Fee data could not be verified for this class and month. Displayed fee statuses may be incomplete; do not record a payment until the data loads successfully.');
+        showNotification('error', `Fee data could not be verified. ${getFriendlyErrorMessage(error)} Use Retry to reload authoritative records.`);
       }
     };
 
-    const unsubscribePrevious = onSnapshot(previousFeeRef, (snapshot) => {
+    const unsubscribePrevious = onSnapshot(previousFeeRef, { includeMetadataChanges: true }, (snapshot) => {
+      if (snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites) return;
       try {
         previousRecords = readFeeRecords(snapshot, selectedClassId, previousMonth);
         gotPrevious = true;
@@ -887,7 +1415,8 @@ export default function Fees() {
       }
     }, (error) => handleSnapshotError('previous-month', error));
 
-    const unsubscribeCurrent = onSnapshot(currentFeeRef, (snapshot) => {
+    const unsubscribeCurrent = onSnapshot(currentFeeRef, { includeMetadataChanges: true }, (snapshot) => {
+      if (snapshot.metadata.fromCache || snapshot.metadata.hasPendingWrites) return;
       try {
         currentRecords = readFeeRecords(snapshot, selectedClassId, selectedMonth);
         gotCurrent = true;
@@ -897,14 +1426,28 @@ export default function Fees() {
       }
     }, (error) => handleSnapshotError('current-month', error));
 
+    // Server-only reads make offline/unavailable failures explicit instead of treating cache as verified.
+    void Promise.all([getDocFromServer(currentFeeRef), getDocFromServer(previousFeeRef)]).catch((error: any) => {
+      // If both listeners have already delivered authoritative server snapshots, their result is sufficient.
+      if (active && !(gotCurrent && gotPrevious)) handleSnapshotError('server-confirmation', error);
+    });
+
     return () => {
       active = false;
       unsubscribePrevious();
       unsubscribeCurrent();
     };
-  }, [selectedClassId, selectedMonth, docKey, eligibleStudentsForMonth, monthlyFee, currentUserEmail]);
+  }, [selectedClassId, selectedMonth, docKey, eligibleStudentsForMonth, monthlyFee, currentUserEmail, feeRetryCount, showNotification]);
 
   useEffect(() => setCurrentPage(1), [statusFilter, genderFilter, selectedClassId, selectedMonth]);
+
+  useEffect(() => () => {
+    if (notificationTimerRef.current) clearTimeout(notificationTimerRef.current);
+  }, []);
+
+  useEffect(() => {
+    setBulkConfirmation(null);
+  }, [currentUserEmail, selectedClassId, selectedMonth]);
 
   const sortedStudentsList = useMemo(() => {
     const list = [...eligibleStudentsForMonth];
@@ -950,7 +1493,11 @@ export default function Fees() {
   const openPaymentModal = (student: any) => {
     const studentId = getStudentKey(student);
     if (!studentId || !currentUserEmail || !hasAuthenticatedTenantSession(currentUserEmail)) {
-      window.alert('This student or teacher identity could not be verified. No payment was opened.');
+      showNotification('error', 'This student or teacher identity could not be verified. No payment was opened.');
+      return;
+    }
+    if (feeDataStatus !== 'ready') {
+      showNotification('warning', feeDataStatus === 'error' ? 'Fee records could not be verified. Retry the read before recording a payment.' : 'Fee records are still being verified. Please wait before recording a payment.');
       return;
     }
 
@@ -978,7 +1525,7 @@ export default function Fees() {
   const closeModal = () => {
     if (paymentInFlightRef.current) return;
     if (paymentOperationRef.current?.outcomeUncertain) {
-      window.alert('The last payment result is not confirmed. Retry the same amount to reconcile it before closing this payment form.');
+      showNotification('error', 'The last payment result is not confirmed. Retry the same amount to reconcile it before closing this payment form.');
       return;
     }
     setActiveModalStudent(null);
@@ -987,38 +1534,60 @@ export default function Fees() {
   };
 
   const handleSaveModalPayment = async () => {
+    const devTimingEnabled = (import.meta as any).env?.DEV === true;
+    const paymentPerfStart = devTimingEnabled && typeof performance !== 'undefined' ? performance.now() : 0;
+    const paymentPerfMarks: Record<string, number> = {};
+    const markPaymentPerf = (label: string) => {
+      if (devTimingEnabled && typeof performance !== 'undefined') paymentPerfMarks[label] = performance.now();
+    };
     if (paymentInFlightRef.current) return;
+    if (feeDataStatus !== 'ready') {
+      showNotification('warning', 'Wait until current and previous fee records are verified by the server before saving a payment.');
+      return;
+    }
     const operation = paymentOperationRef.current;
     if (!activeModalStudent || !operation) {
-      window.alert('The payment session is no longer valid. Reopen the student payment form.');
+      showNotification('error', 'The payment session is no longer valid. Reopen the student payment form.');
       return;
     }
     if (
       operation.teacherEmail !== currentUserEmail || operation.classId !== selectedClassId ||
       operation.month !== selectedMonth || operation.studentId !== getStudentKey(activeModalStudent)
     ) {
-      window.alert('The selected teacher, class, month, or student changed. Reopen the payment form.');
+      showNotification('error', 'The selected teacher, class, month, or student changed. Reopen the payment form.');
       return;
     }
 
     const paymentAmount = parseOptionalMoney(modalPaidInput);
     if (paymentAmount === null || paymentAmount <= MONEY_EPSILON) {
-      window.alert('Enter a valid payment amount greater than zero.');
+      showNotification('error', 'Enter a valid payment amount greater than zero.');
       return;
     }
     if (operation.paymentAmount !== undefined && roundMoney(paymentAmount) !== operation.paymentAmount) {
-      window.alert('A previous submission may still be processing. Keep the same amount while retrying this payment; a new amount requires a verified outcome and a new payment session.');
+      showNotification('error', 'A previous submission may still be processing. Keep the same amount while retrying this payment; a new amount requires a verified outcome and a new payment session.');
       return;
     }
     if (!isValidMonthKey(operation.month)) {
-      window.alert('Invalid month key. No payment was saved.');
+      showNotification('error', 'Invalid month key. No payment was saved.');
       return;
     }
 
+    markPaymentPerf('inputValidationCompletedAt');
     paymentInFlightRef.current = true;
+    setIsPaymentSaving(true);
+    let operationStage = 'input-validation';
     try {
-      await assertVerifiedTenant(operation.teacherEmail);
+      // Fast local session check only. Authoritative teacher UID/email/role verification remains
+      // inside the Firestore transaction below, along with Firebase Security Rules.
+      operationStage = 'session-check';
+      const preflightUser = auth.currentUser;
+      if (!preflightUser || normalizeTeacherEmail(preflightUser.email) !== operation.teacherEmail) {
+        throw new Error('Access denied. Sign in with the teacher account that owns this fee record.');
+      }
+      markPaymentPerf('sessionCheckCompletedAt');
       if (!operation.id) {
+        operationStage = 'create-idempotency-key';
+        const idempotencyStartedAt = devTimingEnabled && typeof performance !== 'undefined' ? performance.now() : 0;
         const displayedRecord = feeMap[operation.studentId];
         const monthlyFeeAtSubmit = parseOptionalMoney(modalFeeOverride)
           ?? parseOptionalMoney(displayedRecord?.monthlyFeeDue)
@@ -1036,8 +1605,11 @@ export default function Fees() {
           monthlyFeeAtSubmit
         ]);
         operation.id = await createPaymentIdempotencyKey(submissionBasis);
+        if (devTimingEnabled && typeof performance !== 'undefined') paymentPerfMarks.idempotencyKeyMs = performance.now() - idempotencyStartedAt;
         operation.paymentAmount = roundMoney(paymentAmount);
         operation.idempotencyBasis = submissionBasis;
+      } else if (devTimingEnabled) {
+        paymentPerfMarks.idempotencyKeyMs = 0;
       }
       const previousMonth = getMonthOffset(operation.month, -1);
       const currentFeeRef = doc(db, 'users', operation.teacherEmail, 'fees', `${operation.classId}_${operation.month}`);
@@ -1046,18 +1618,27 @@ export default function Fees() {
       const paymentRef = doc(db, 'users', operation.teacherEmail, 'fees', `${operation.classId}_${operation.month}`, 'payments', operation.id);
       const teacherProfileRef = doc(db, 'users', operation.teacherEmail);
 
+      operationStage = 'transaction-start';
+      const transactionInvokedAt = devTimingEnabled && typeof performance !== 'undefined' ? performance.now() : 0;
+      if (devTimingEnabled && typeof performance !== 'undefined') paymentPerfMarks.transactionInvokedAt = transactionInvokedAt;
       const result = await runTransaction(db, async (tx) => {
+        if (devTimingEnabled && typeof performance !== 'undefined' && paymentPerfMarks.transactionCallbackStartedAt === undefined) {
+          paymentPerfMarks.transactionCallbackStartedAt = performance.now();
+        }
+        operationStage = 'transaction-authentication';
         const userNow = auth.currentUser;
         if (!userNow || normalizeTeacherEmail(userNow.email) !== operation.teacherEmail) {
           throw new Error('Access denied. The authenticated teacher no longer matches this fee record.');
         }
 
         // All transaction reads occur before any write.
+        operationStage = 'transaction-reads';
         const [paymentSnap, classSnap, currentSnap, previousSnap, teacherProfileSnap] = await Promise.all([
           tx.get(paymentRef), tx.get(classRef), tx.get(currentFeeRef), tx.get(previousFeeRef), tx.get(teacherProfileRef)
         ]);
+        operationStage = 'transaction-validation';
         assertTeacherProfile(teacherProfileSnap.exists() ? teacherProfileSnap.data() : null, userNow, operation.teacherEmail);
-        if (paymentSnap.exists()) return 'duplicate' as const;
+        if (paymentSnap.exists()) { operationStage = 'transaction-commit'; return 'duplicate' as const; }
         if (!classSnap.exists()) throw new Error('The selected class no longer exists. No payment was saved.');
         const classData = classSnap.data();
         const verifiedStudent = findStudentInClass(classData, operation.studentId);
@@ -1101,6 +1682,7 @@ export default function Fees() {
           paidTowardsCurrentMonth: paidTowardsCurrentAfter
         };
 
+        operationStage = 'transaction-writes';
         if (amountToPrevious > MONEY_EPSILON) {
           if (!previousSnap.exists() || !isPlainObject(previousRaw)) {
             throw new Error('Previous-month dues exist, but the previous-month student record is missing. Reconcile it before receiving this payment.');
@@ -1164,23 +1746,32 @@ export default function Fees() {
         });
 
         applyFeeStatusPatch(tx, classRef, classData, { [operation.studentId]: updatedCurrentRecord }, [operation.studentId]);
+        operationStage = 'transaction-commit';
         return 'saved' as const;
       });
 
+      if (devTimingEnabled && typeof performance !== 'undefined') {
+        paymentPerfMarks.transactionConfirmedAt = performance.now();
+        paymentPerfMarks.transactionOutcome = result === 'duplicate' ? 0 : 1;
+        paymentPerfMarks.transactionInvokedAt = transactionInvokedAt;
+      }
       if (result === 'duplicate') {
         // The receipt exists, so a prior commit succeeded even if its acknowledgement was lost.
-        window.alert('This payment was already recorded. No second payment was applied.');
+        showNotification('info', 'This payment was already recorded. No second payment was applied.');
+      } else {
+        showNotification('success', `Payment of PKR ${paymentAmount.toLocaleString()} was saved for ${String(activeModalStudent?.name ?? 'the selected student')} in ${currentClass.name} (${operation.month}).`);
       }
       operation.outcomeUncertain = false;
       // Clear directly because closeModal intentionally refuses to close while a transaction is in flight.
       setActiveModalStudent(null);
       setModalFeeOverride(null);
       paymentOperationRef.current = null;
-    } catch (error) {
-      console.error('Error processing fee payment:', error);
-      window.alert(getFriendlyErrorMessage(error));
+    } catch (error: any) {
+      console.error('[Fees] Payment operation failed:', { stage: operationStage, code: error?.code, normalizedCode: normalizeFirebaseErrorCode(error?.code), name: error?.name, message: error?.message, customData: error?.customData, error });
+      showNotification('error', getFriendlyErrorMessage(error));
       const message = error instanceof Error ? error.message : '';
-      const definitelyRejected = error?.code === 'permission-denied' || error?.code === 'unauthenticated' ||
+      const normalizedErrorCode = normalizeFirebaseErrorCode(error?.code);
+      const definitelyRejected = ['permission-denied', 'unauthenticated', 'user-token-expired', 'invalid-user-token', 'invalid-argument'].includes(normalizedErrorCode) ||
         /overpay|exceeds outstanding|no outstanding dues|malformed|invalid|does not match|missing|no longer exists|no longer belongs|access denied|teacher session changed|no payment was saved/i.test(message);
       if (definitelyRejected && paymentOperationRef.current) {
         // Firestore transactions are atomic; known validation/permission failures applied no writes.
@@ -1194,21 +1785,74 @@ export default function Fees() {
       // Keep the key and require reconciliation for ambiguous network failures.
     } finally {
       paymentInFlightRef.current = false;
+      setIsPaymentSaving(false);
+      if (devTimingEnabled && typeof performance !== 'undefined') {
+        const uiUpdateScheduledAt = performance.now();
+          const transactionInvoked = paymentPerfMarks.transactionInvokedAt;
+        const transactionCallbackStarted = paymentPerfMarks.transactionCallbackStartedAt;
+        const transactionConfirmed = paymentPerfMarks.transactionConfirmedAt;
+        const measurement = {
+          inputValidationMs: paymentPerfMarks.inputValidationCompletedAt === undefined ? null : Math.round((paymentPerfMarks.inputValidationCompletedAt - paymentPerfStart) * 100) / 100,
+          authPreflightMs: paymentPerfMarks.sessionCheckCompletedAt === undefined || paymentPerfMarks.inputValidationCompletedAt === undefined
+            ? null : Math.round((paymentPerfMarks.sessionCheckCompletedAt - paymentPerfMarks.inputValidationCompletedAt) * 100) / 100,
+          forcedTokenRefreshAndPreflightProfileRead: 'skipped; authoritative profile read remains inside transaction',
+          idempotencyKeyMs: paymentPerfMarks.idempotencyKeyMs ?? null,
+          transactionStartupMs: transactionInvoked !== undefined && transactionCallbackStarted !== undefined
+            ? Math.round((transactionCallbackStarted - transactionInvoked) * 100) / 100 : null,
+          transactionCommitConfirmationMs: transactionInvoked !== undefined && transactionConfirmed !== undefined
+            ? Math.round((transactionConfirmed - transactionInvoked) * 100) / 100 : null,
+          totalUntilUiUpdateScheduledMs: Math.round((uiUpdateScheduledAt - paymentPerfStart) * 100) / 100,
+          outcomeConfirmed: transactionConfirmed !== undefined
+        };
+        window.requestAnimationFrame(() => {
+          console.info('[Fees][dev payment timing]', {
+            ...measurement,
+            uiNextPaintMs: Math.round((performance.now() - uiUpdateScheduledAt) * 100) / 100
+          });
+        });
+      }
     }
   };
 
-  const markAllPaid = async () => {
+  const requestBulkAction = (action: 'paid' | 'unpaid') => {
+    if (!currentUserEmail || !selectedClassId || !isValidMonthKey(selectedMonth)) {
+      showNotification('warning', 'Select a verified class and fee month first.');
+      return;
+    }
+    if (feeDataStatus !== 'ready') {
+      showNotification('warning', feeDataStatus === 'error' ? 'Fee records failed verification. Retry the read before a bulk action.' : 'Fee records are still loading; bulk actions are disabled until server verification completes.');
+      return;
+    }
+    const studentIds = sortedStudentsList.map((student: any) => getStudentKey(student)).filter((id): id is string => Boolean(id));
+    if (studentIds.length === 0 || new Set(studentIds).size !== studentIds.length) {
+      showNotification('error', 'The selected class has no eligible students or contains duplicate student IDs. Resolve the roster before continuing.');
+      return;
+    }
+    setBulkConfirmation({ action, classId: selectedClassId, className: currentClass.name, month: selectedMonth, studentIds: [...studentIds].sort(), estimatedTotal: roundMoney(totalPendingDuesPKR), studentCount: studentIds.length });
+  };
+
+  const markAllPaid = async (confirmation: NonNullable<typeof bulkConfirmation>) => {
     if (bulkActionInFlightRef.current || !selectedClassId || !currentUserEmail || !isValidMonthKey(selectedMonth)) return;
+    if (confirmation.action !== 'paid' || confirmation.classId !== selectedClassId || confirmation.month !== selectedMonth || confirmation.className !== currentClass.name || feeDataStatus !== 'ready') {
+      showNotification('warning', 'The class, month, or verified fee state changed. Review the fee data and confirm the action again.');
+      setBulkConfirmation(null);
+      return;
+    }
     if (sortedStudentsList.length > BULK_TRANSACTION_STUDENT_LIMIT) {
-      window.alert(`This class has more than ${BULK_TRANSACTION_STUDENT_LIMIT} students. Use individual payments so the transaction stays within Firestore limits.`);
+      setBulkConfirmation(null);
+      showNotification('error', `This class has more than ${BULK_TRANSACTION_STUDENT_LIMIT} students. Use individual payments so the transaction stays within Firestore limits.`);
       return;
     }
     const targets = sortedStudentsList.map((student: any) => ({ student, id: getStudentKey(student) })).filter((item): item is { student: any; id: string } => Boolean(item.id));
-    if (targets.length === 0) return;
+    if (targets.length === 0) { setBulkConfirmation(null); return; }
 
     bulkActionInFlightRef.current = true;
+    setIsBulkProcessing(true);
+    setBulkConfirmation(null);
+    let operationStage = 'tenant-verification';
     try {
       await assertVerifiedTenant(currentUserEmail);
+      operationStage = 'transaction-preparation';
       const ownerEmail = currentUserEmail;
       const classId = selectedClassId;
       const month = selectedMonth;
@@ -1219,9 +1863,12 @@ export default function Fees() {
       const teacherProfileRef = doc(db, 'users', ownerEmail);
       const paymentIds = new Map(targets.map(({ id }) => [id, createOperationId()]));
 
+      operationStage = 'transaction-start';
       await runTransaction(db, async (tx) => {
+        operationStage = 'transaction-authentication';
         const userNow = auth.currentUser;
         if (!userNow || normalizeTeacherEmail(userNow.email) !== ownerEmail) throw new Error('Access denied. The teacher session changed.');
+        operationStage = 'transaction-reads';
         const [classSnap, currentSnap, previousSnap, teacherProfileSnap] = await Promise.all([tx.get(classRef), tx.get(currentRef), tx.get(previousRef), tx.get(teacherProfileRef)]);
         assertTeacherProfile(teacherProfileSnap.exists() ? teacherProfileSnap.data() : null, userNow, ownerEmail);
         if (!classSnap.exists()) throw new Error('The selected class no longer exists.');
@@ -1233,6 +1880,19 @@ export default function Fees() {
         const previousUpdates: Record<string, any> = {};
         const classStatusRecords: Record<string, StudentFeeRecord> = {};
         const receipts: { ref: DocumentReference<DocumentData>; data: any }[] = [];
+        let authoritativeOutstandingTotal = 0;
+
+        const liveClassName = String(classData.name || classData.className || classData.title || classId);
+        const liveEligibleIds = extractStudentsFromClass(classData).filter((student: any) => {
+          const name = String(student?.name ?? '').trim();
+          if (!name || name.toLowerCase() === 'unnamed student' || !getStudentKey(student)) return false;
+          const admissionMonth = getStudentAdmissionMonth(student);
+          return !admissionMonth || month >= admissionMonth;
+        }).map((student: any) => getStudentKey(student)!).sort();
+        const confirmedIds = [...confirmation.studentIds].sort();
+        if (liveClassName !== confirmation.className || JSON.stringify(liveEligibleIds) !== JSON.stringify(confirmedIds)) {
+          throw new Error('The class roster or eligible student population changed after confirmation. Refresh the register and confirm the bulk action again.');
+        }
 
         targets.forEach(({ student, id }) => {
           const verifiedStudent = findStudentInClass(classData, id);
@@ -1243,6 +1903,7 @@ export default function Fees() {
           const state = getTransactionFeeState(currentRaw, previousRaw, verifiedStudent, previousMonth, getStudentMonthlyFee(verifiedStudent, classData));
           const obligation = roundMoney(state.previousMonthDues + state.monthlyFeeDue);
           const outstanding = Math.max(0, roundMoney(state.previousMonthDues + state.monthlyFeeDue - state.paidTowardsCurrentMonth));
+          authoritativeOutstandingTotal = roundMoney(authoritativeOutstandingTotal + outstanding);
 
           if (outstanding <= MONEY_EPSILON || obligation <= MONEY_EPSILON) {
             const unchanged: StudentFeeRecord = {
@@ -1306,6 +1967,10 @@ export default function Fees() {
           });
         });
 
+        if (Math.abs(roundMoney(authoritativeOutstandingTotal) - roundMoney(confirmation.estimatedTotal)) > MONEY_EPSILON) {
+          throw new Error(`The authoritative outstanding total is now PKR ${roundMoney(authoritativeOutstandingTotal).toLocaleString()}, which differs from the confirmed estimate. No records were changed; review and confirm again.`);
+        }
+        operationStage = 'transaction-writes';
         // No writes occurred before every selected student passed validation.
         if (Object.keys(previousUpdates).length > 0) {
           const previousArgs: any[] = [];
@@ -1316,27 +1981,40 @@ export default function Fees() {
         writeFeeRecordFields(tx, currentRef, currentUpdates, { classId, month, updatedAt: now }, currentSnap.exists(), currentRawMap);
         receipts.forEach((receipt) => tx.set(receipt.ref, receipt.data));
         applyFeeStatusPatch(tx, classRef, classData, classStatusRecords, targets.map((item) => item.id));
+        operationStage = 'transaction-commit';
       });
-    } catch (error) {
-      console.error('Error marking all students paid:', error);
-      window.alert(getFriendlyErrorMessage(error));
+      showNotification('success', `Mark All Paid completed for ${targets.length} students in ${month}. Receipts were created for outstanding balances and balances were updated transactionally.`);
+    } catch (error: any) {
+      console.error('[Fees] Mark All Paid failed:', { stage: operationStage, code: error?.code, normalizedCode: normalizeFirebaseErrorCode(error?.code), name: error?.name, message: error?.message, customData: error?.customData, error });
+      showNotification('error', getFriendlyErrorMessage(error));
     } finally {
       bulkActionInFlightRef.current = false;
+      setIsBulkProcessing(false);
     }
   };
 
-  const markAllUnpaid = async () => {
+  const markAllUnpaid = async (confirmation: NonNullable<typeof bulkConfirmation>) => {
     if (bulkActionInFlightRef.current || !selectedClassId || !currentUserEmail || !isValidMonthKey(selectedMonth)) return;
+    if (confirmation.action !== 'unpaid' || confirmation.classId !== selectedClassId || confirmation.month !== selectedMonth || feeDataStatus !== 'ready') {
+      showNotification('warning', 'The class, month, or verified fee state changed. Review the fee data and confirm the action again.');
+      setBulkConfirmation(null);
+      return;
+    }
     if (sortedStudentsList.length > BULK_TRANSACTION_STUDENT_LIMIT) {
-      window.alert(`This class has more than ${BULK_TRANSACTION_STUDENT_LIMIT} students. Use smaller changes so the transaction stays within Firestore limits.`);
+      setBulkConfirmation(null);
+      showNotification('error', `This class has more than ${BULK_TRANSACTION_STUDENT_LIMIT} students. Use smaller changes so the transaction stays within Firestore limits.`);
       return;
     }
     const targets = sortedStudentsList.map((student: any) => ({ student, id: getStudentKey(student) })).filter((item): item is { student: any; id: string } => Boolean(item.id));
-    if (targets.length === 0) return;
+    if (targets.length === 0) { setBulkConfirmation(null); return; }
 
     bulkActionInFlightRef.current = true;
+    setIsBulkProcessing(true);
+    setBulkConfirmation(null);
+    let operationStage = 'tenant-verification';
     try {
       await assertVerifiedTenant(currentUserEmail);
+      operationStage = 'transaction-preparation';
       const ownerEmail = currentUserEmail;
       const classId = selectedClassId;
       const month = selectedMonth;
@@ -1346,13 +2024,26 @@ export default function Fees() {
       const classRef = doc(db, 'users', ownerEmail, 'classes', classId);
       const teacherProfileRef = doc(db, 'users', ownerEmail);
 
+      operationStage = 'transaction-start';
       await runTransaction(db, async (tx) => {
+        operationStage = 'transaction-authentication';
         const userNow = auth.currentUser;
         if (!userNow || normalizeTeacherEmail(userNow.email) !== ownerEmail) throw new Error('Access denied. The teacher session changed.');
+        operationStage = 'transaction-reads';
         const [classSnap, currentSnap, previousSnap, teacherProfileSnap] = await Promise.all([tx.get(classRef), tx.get(currentRef), tx.get(previousRef), tx.get(teacherProfileRef)]);
         assertTeacherProfile(teacherProfileSnap.exists() ? teacherProfileSnap.data() : null, userNow, ownerEmail);
         if (!classSnap.exists()) throw new Error('The selected class no longer exists.');
         const classData = classSnap.data();
+        const liveClassName = String(classData.name || classData.className || classData.title || classId);
+        const liveEligibleIds = extractStudentsFromClass(classData).filter((student: any) => {
+          const name = String(student?.name ?? '').trim();
+          if (!name || name.toLowerCase() === 'unnamed student' || !getStudentKey(student)) return false;
+          const admissionMonth = getStudentAdmissionMonth(student);
+          return !admissionMonth || month >= admissionMonth;
+        }).map((student: any) => getStudentKey(student)!).sort();
+        if (liveClassName !== confirmation.className || JSON.stringify(liveEligibleIds) !== JSON.stringify([...confirmation.studentIds].sort())) {
+          throw new Error('The class roster or eligible student population changed after confirmation. Refresh the register and confirm the bulk action again.');
+        }
         const currentRawMap = readFeeRecords(currentSnap, classId, month);
         const previousRawMap = readFeeRecords(previousSnap, classId, previousMonth);
         const now = new Date().toISOString();
@@ -1389,14 +2080,983 @@ export default function Fees() {
           classStatusRecords[id] = updated;
         });
 
+        operationStage = 'transaction-writes';
         writeFeeRecordFields(tx, currentRef, currentUpdates, { classId, month, updatedAt: now }, currentSnap.exists(), currentRawMap);
         applyFeeStatusPatch(tx, classRef, classData, classStatusRecords, targets.map((item) => item.id));
+        operationStage = 'transaction-commit';
       });
-    } catch (error) {
-      console.error('Error marking all students unpaid:', error);
-      window.alert(getFriendlyErrorMessage(error));
+      showNotification('success', `Mark All Unpaid completed for ${targets.length} students in ${month}. No payment history was reset or erased.`);
+    } catch (error: any) {
+      console.error('[Fees] Mark All Unpaid failed:', { stage: operationStage, code: error?.code, normalizedCode: normalizeFirebaseErrorCode(error?.code), name: error?.name, message: error?.message, customData: error?.customData, error });
+      showNotification('error', getFriendlyErrorMessage(error));
     } finally {
       bulkActionInFlightRef.current = false;
+      setIsBulkProcessing(false);
+    }
+  };
+
+  const openReportConfiguration = () => {
+    if (!currentUserEmail || !selectedClassId || classDataStatus !== 'ready') {
+      showNotification('warning', 'Select a class under a verified teacher session before creating a report.');
+      return;
+    }
+    setReportStartMonth(selectedMonth);
+    setReportEndMonth(selectedMonth);
+    setReportScope('selected');
+    setReportError(null);
+    setGeneratedReport(null);
+    setIsReportModalOpen(true);
+  };
+
+  const currentReportSignature = () => [
+    currentUserEmail || '', selectedClassId, currentClass.name, reportScope,
+    reportScope === 'selected' ? selectedMonth : reportScope === 'range' ? `${reportStartMonth}:${reportEndMonth}` : 'all-history'
+  ].join('|');
+
+  const handleReportAction = async (action: FeeReportAction) => {
+    if (reportInFlightRef.current) return;
+    let operationStage = 'initial report validation';
+    let operationDomain = 'report validation';
+    let activeQueryDiagnostics: Record<string, unknown> = { operation: 'report action entry', action };
+    const reportFailureContexts = new WeakMap<object, { stage: string; domain: string; diagnostics?: Record<string, unknown> }>();
+    const rememberReportFailure = (error: unknown, stage: string, domain: string, diagnostics?: Record<string, unknown>) => {
+      if (typeof error === 'object' && error !== null) {
+        reportFailureContexts.set(error, { stage, domain, diagnostics });
+      }
+    };
+    const runReportStage = async <T,>(
+      stage: string,
+      domain: string,
+      operation: () => Promise<T>,
+      diagnostics?: Record<string, unknown>
+    ): Promise<T> => {
+      operationStage = stage;
+      operationDomain = domain;
+      if (diagnostics) activeQueryDiagnostics = diagnostics;
+      try {
+        return await operation();
+      } catch (error) {
+        rememberReportFailure(error, stage, domain, diagnostics);
+        throw error;
+      }
+    };
+    const runReportSyncStage = <T,>(
+      stage: string,
+      domain: string,
+      operation: () => T,
+      diagnostics?: Record<string, unknown>
+    ): T => {
+      operationStage = stage;
+      operationDomain = domain;
+      if (diagnostics) activeQueryDiagnostics = diagnostics;
+      try {
+        return operation();
+      } catch (error) {
+        rememberReportFailure(error, stage, domain, diagnostics);
+        throw error;
+      }
+    };
+    let legacyCompatibilityLookupUsed = false;
+    let legacyCompatibilityCutoffMonth: string | null = null;
+    let printWindow: Window | null = null;
+    if (action === 'print') {
+      operationStage = 'print window initialization';
+      operationDomain = 'PDF delivery';
+      printWindow = window.open('', '_blank');
+      if (!printWindow) {
+        setReportError('The print window was blocked by the browser. Allow pop-ups for EduTrack, then click Print again.');
+        return;
+      }
+      printWindow.document.open();
+      printWindow.document.write('<!doctype html><title>EduTrack report</title><body style="font:14px Arial;padding:28px;color:#334155">Preparing your verified fee report…</body>');
+      printWindow.document.close();
+    }
+
+    reportInFlightRef.current = true;
+    setIsReportGenerating(true);
+    setReportError(null);
+    try {
+      operationStage = 'initial report validation';
+      operationDomain = 'report validation';
+      if (!selectedClassId || !currentUserEmail || classDataStatus !== 'ready') {
+        throw new Error('A verified class and teacher session are required before generating a report.');
+      }
+      let reportPackage = generatedReport && generatedReport.signature === currentReportSignature()
+        ? generatedReport
+        : null;
+
+      if (!reportPackage) {
+        const signedInUser = auth.currentUser;
+        const tenantEmail = normalizeTeacherEmail(signedInUser?.email);
+        if (!signedInUser || !tenantEmail || tenantEmail !== currentUserEmail) {
+          throw new Error('Access denied. Sign in with the teacher account that owns this class.');
+        }
+        const uidAtStart = signedInUser.uid;
+        // Use normal Firebase token-refresh behavior; the authoritative profile and class are read from the server below.
+        await runReportStage(
+          'teacher identity/token verification',
+          'Firebase authentication',
+          () => signedInUser.getIdToken(),
+          { operation: 'getIdToken', forcedRefresh: false, verifiedTenantSessionRequired: true }
+        );
+        const teacherProfileRef = doc(db, 'users', tenantEmail);
+        const classRef = doc(db, 'users', tenantEmail, 'classes', selectedClassId);
+        // Keep the reads concurrent while tagging failures individually so Promise.all cannot hide the failing read stage.
+        const teacherProfilePromise = runReportStage(
+          'server-side teacher-profile read',
+          'Firestore read',
+          () => getDocFromServer(teacherProfileRef),
+          { operation: 'getDocFromServer', pathTemplate: 'users/{verifiedTeacherEmail}', readSource: 'server' }
+        );
+        const classPromise = runReportStage(
+          'selected class document read',
+          'Firestore read',
+          () => getDocFromServer(classRef),
+          { operation: 'getDocFromServer', pathTemplate: 'users/{verifiedTeacherEmail}/classes/{selectedClassId}', readSource: 'server', classIdLength: selectedClassId.length }
+        );
+        const [teacherProfileSnap, classSnap] = await Promise.all([teacherProfilePromise, classPromise]);
+        operationStage = 'teacher profile validation';
+        operationDomain = 'tenant security validation';
+        assertTeacherProfile(teacherProfileSnap.exists() ? teacherProfileSnap.data() : null, signedInUser, tenantEmail);
+        if (!classSnap.exists()) throw new Error('The selected class no longer exists under this teacher account.');
+        if (auth.currentUser?.uid !== uidAtStart || normalizeTeacherEmail(auth.currentUser?.email) !== tenantEmail) {
+          throw new Error('The authenticated teacher changed during report generation. Reopen the report and try again.');
+        }
+        const classData = classSnap.data();
+        const className = String(classData.name || classData.className || classData.title || selectedClassId);
+
+        let periodMonths: string[];
+        operationStage = 'report scope and month validation';
+        operationDomain = 'report validation';
+        if (reportScope === 'selected') {
+          if (!isValidMonthKey(selectedMonth)) throw new Error('The selected fee month is invalid.');
+          periodMonths = [selectedMonth];
+        } else if (reportScope === 'range') {
+          periodMonths = getMonthsBetween(reportStartMonth, reportEndMonth);
+        } else {
+          periodMonths = [];
+        }
+
+        // The standard documentId() + orderBy() + startAt()/endAt() cursor query is a documented
+        // Firestore pattern. Keep it as the primary path and only use the compatibility path if
+        // this exact query construction/read is rejected with invalid-argument at runtime.
+        const feeCollection = collection(db, 'users', tenantEmail, 'fees');
+        const feeDocumentSnapshots: DocumentSnapshot<DocumentData>[] = [];
+        const feeDocumentsById = new Map<string, DocumentSnapshot<DocumentData>>();
+        const classDocPrefix = `${selectedClassId}_`;
+        const feeQueryDiagnostics = {
+          collectionPathTemplate: 'users/{verifiedTeacherEmail}/fees',
+          queryKind: 'orderBy(documentId()) + startAt/endAt cursor range',
+          classIdLength: selectedClassId.length,
+          lowerBoundSuffix: '_0000-00',
+          upperBoundSuffix: '_9999-99',
+          maxDocuments: MAX_FEE_REPORT_MONTHS + 1,
+          scope: reportScope
+        };
+        let cursorQueryFailed = false;
+        try {
+          const feeQuery = runReportSyncStage(
+            'monthly fee query construction',
+            'Firestore query construction',
+            () => query(
+              feeCollection,
+              orderBy(documentId()),
+              startAt(`${selectedClassId}_0000-00`),
+              endAt(`${selectedClassId}_9999-99`),
+              limit(MAX_FEE_REPORT_MONTHS + 1)
+            ),
+            feeQueryDiagnostics
+          );
+          const feeDocsSnapshot = await runReportStage(
+            'historical fee documents server read',
+            'Firestore read',
+            () => getDocsFromServer(feeQuery),
+            feeQueryDiagnostics
+          );
+          feeDocumentSnapshots.push(...feeDocsSnapshot.docs);
+        } catch (feeQueryError: any) {
+          const savedContext = typeof feeQueryError === 'object' && feeQueryError !== null
+            ? reportFailureContexts.get(feeQueryError)
+            : undefined;
+          const failedStage = savedContext?.stage || operationStage;
+          if (normalizeFirebaseErrorCode(feeQueryError?.code) !== 'invalid-argument' ||
+              !['monthly fee query construction', 'historical fee documents server read'].includes(failedStage)) {
+            throw feeQueryError;
+          }
+
+          cursorQueryFailed = true;
+          legacyCompatibilityLookupUsed = true;
+          console.warn('[Fees] Document-ID monthly query was rejected; attempting bounded tenant-scoped compatibility retrieval.', {
+            operationStage: failedStage,
+            errorCode: feeQueryError?.code ?? null,
+            normalizedErrorCode: normalizeFirebaseErrorCode(feeQueryError?.code),
+            errorMessage: feeQueryError?.message ?? String(feeQueryError),
+            queryDiagnostics: savedContext?.diagnostics || feeQueryDiagnostics,
+            fallback: 'where(classId == selectedClassId) plus bounded direct monthly-document lookups',
+            note: 'No tenant-wide collection scan is performed.'
+          });
+
+          const classFieldQuery = runReportSyncStage(
+            'compatibility classId equality-query construction',
+            'Firestore query construction',
+            () => query(feeCollection, where('classId', '==', selectedClassId), limit(MAX_FEE_REPORT_MONTHS + 1)),
+            {
+              collectionPathTemplate: 'users/{verifiedTeacherEmail}/fees',
+              queryKind: "where('classId', '==', selectedClassId)",
+              maxDocuments: MAX_FEE_REPORT_MONTHS + 1,
+              legacyDocsWithoutClassIdRequireDirectLookup: true
+            }
+          );
+          const classFieldSnapshot = await runReportStage(
+            'compatibility classId equality-query server read',
+            'Firestore read',
+            () => getDocsFromServer(classFieldQuery),
+            {
+              collectionPathTemplate: 'users/{verifiedTeacherEmail}/fees',
+              queryKind: "where('classId', '==', selectedClassId)",
+              maxDocuments: MAX_FEE_REPORT_MONTHS + 1
+            }
+          );
+          if (classFieldSnapshot.size > MAX_FEE_REPORT_MONTHS) {
+            throw new Error(`This class has more than ${MAX_FEE_REPORT_MONTHS} monthly fee documents. Report generation stopped rather than omitting historical records.`);
+          }
+          classFieldSnapshot.docs.forEach((snapshot) => feeDocumentsById.set(snapshot.id, snapshot));
+
+          let compatibilityMonths: string[];
+          if (reportScope === 'history') {
+            const classQueryMonths = classFieldSnapshot.docs
+              .map((snapshot) => {
+                if (!snapshot.id.startsWith(classDocPrefix)) return null;
+                const suffix = snapshot.id.slice(classDocPrefix.length);
+                return isValidMonthKey(suffix) ? suffix : null;
+              })
+              .filter((month): month is string => month !== null)
+              .sort();
+            const latestFieldMonth = classQueryMonths.length ? classQueryMonths[classQueryMonths.length - 1] : getCurrentMonthKey();
+            const latestProbeMonth = latestFieldMonth > getCurrentMonthKey() ? latestFieldMonth : getCurrentMonthKey();
+            const cutoffMonth = getMonthOffset(latestProbeMonth, -(MAX_FEE_REPORT_MONTHS - 1));
+            legacyCompatibilityCutoffMonth = cutoffMonth;
+            compatibilityMonths = getMonthsBetween(cutoffMonth, latestProbeMonth);
+          } else {
+            compatibilityMonths = periodMonths;
+          }
+
+          // Point-read only predictable monthly paths; this is bounded by the report month limit
+          // and discovers legacy documents whose classId field is absent, without scanning all tenants.
+          for (let start = 0; start < compatibilityMonths.length; start += 20) {
+            const batchMonths = compatibilityMonths.slice(start, start + 20);
+            const monthlySnapshots = await Promise.all(batchMonths.map((month) => runReportStage(
+              `legacy monthly document server read (${month})`,
+              'Firestore read',
+              () => getDocFromServer(doc(feeCollection, `${selectedClassId}_${month}`)),
+              {
+                collectionPathTemplate: 'users/{verifiedTeacherEmail}/fees/{classId}_{YYYY-MM}',
+                readKind: 'direct document lookup',
+                month,
+                classIdLength: selectedClassId.length,
+                reportScope
+              }
+            )));
+            monthlySnapshots.forEach((snapshot) => {
+              if (snapshot.exists()) feeDocumentsById.set(snapshot.id, snapshot);
+            });
+          }
+          feeDocumentSnapshots.push(...feeDocumentsById.values());
+        }
+
+        if (!cursorQueryFailed) {
+          feeDocumentSnapshots.forEach((snapshot) => feeDocumentsById.set(snapshot.id, snapshot));
+        }
+        if (feeDocumentSnapshots.length > MAX_FEE_REPORT_MONTHS || feeDocumentsById.size > MAX_FEE_REPORT_MONTHS) {
+          throw new Error(`This class has more than ${MAX_FEE_REPORT_MONTHS} monthly fee documents in the report's bounded retrieval. Report generation stopped rather than omitting historical records.`);
+        }
+        const verifiedFeeDocumentSnapshots = [...feeDocumentsById.values()];
+
+        interface ReportFeeDoc {
+          month: string;
+          docId: string;
+          data: Record<string, any>;
+          records: Record<string, any>;
+        }
+        interface StoredReportReceipt {
+          paymentId: string;
+          studentId: string;
+          feeMonth: string;
+          amount: number | null;
+          appliedToPreviousDues: number | null;
+          appliedToCurrentMonth: number | null;
+          createdAtDate: Date | null;
+          paymentDate: string;
+          source: string;
+          storedStudentName: string;
+          storedRollNo: string;
+          storedGender: string;
+        }
+
+        const warnings = new Set<string>();
+        let hasDataGaps = false;
+        let warningsTruncated = false;
+        const addReportWarning = (message: string, affectsCompleteness = true) => {
+          if (affectsCompleteness) hasDataGaps = true;
+          if (warnings.has(message)) return;
+          if (warnings.size < MAX_FEE_REPORT_WARNINGS) warnings.add(message);
+          else warningsTruncated = true;
+        };
+        if (legacyCompatibilityLookupUsed) {
+          addReportWarning(reportScope === 'history'
+            ? `The primary document-ID query was rejected. Compatibility retrieval checked at most ${MAX_FEE_REPORT_MONTHS} known monthly document IDs starting at ${legacyCompatibilityCutoffMonth || 'an unavailable cutoff'}; records older than that bounded window cannot be independently ruled out, so this report does not claim complete history.`
+            : 'The primary document-ID query was rejected. Compatibility retrieval recovered monthly records using the classId field and targeted document reads for the selected period; cross-period legacy history may be incomplete, so cumulative historical totals are not treated as verified.');
+        }
+        const feeDocsByMonth = new Map<string, ReportFeeDoc>();
+        operationStage = 'fee-document schema validation and feeRecords parsing';
+        operationDomain = 'Firestore data validation';
+        verifiedFeeDocumentSnapshots.forEach((snapshot) => {
+          if (!snapshot.id.startsWith(classDocPrefix)) {
+            addReportWarning('A fee document returned by the compatibility query did not match the selected class document-ID prefix and was excluded.');
+            return;
+          }
+          const month = snapshot.id.slice(classDocPrefix.length);
+          if (!isValidMonthKey(month)) {
+            addReportWarning('A monthly fee document did not follow the expected classId_YYYY-MM naming format and was not included.');
+            return;
+          }
+          const data = snapshot.data() as Record<string, any>;
+          if (data.classId !== undefined && String(data.classId) !== selectedClassId) {
+            throw new Error(`Fee document ${snapshot.id} has a classId that does not match its path. The report was not generated.`);
+          }
+          if (data.month !== undefined && String(data.month) !== month) {
+            throw new Error(`Fee document ${snapshot.id} has a month that does not match its path. The report was not generated.`);
+          }
+          const records = readFeeRecords(snapshot, selectedClassId, month);
+          Object.entries(records).forEach(([studentId, record]) => {
+            if (!isPlainObject(record)) {
+              addReportWarning(`Fee record for student ID ${studentId} in ${month} is malformed; its balance is not inferred.`);
+              return;
+            }
+            ['paidAmount', 'remainingDues', 'previousMonthDues', 'monthlyFeeDue', 'paidTowardsCurrentMonth'].forEach((field) => {
+              if (Object.prototype.hasOwnProperty.call(record, field) && parseOptionalMoney(record[field]) === null) {
+                addReportWarning(`Fee record for student ID ${studentId} in ${month} has an invalid ${field} value.`);
+              }
+            });
+          });
+          feeDocsByMonth.set(month, { month, docId: snapshot.id, data, records });
+        });
+
+        operationStage = 'historical ledger period calculation';
+        operationDomain = 'report processing';
+        if (reportScope === 'history') {
+          const availableMonths = [...feeDocsByMonth.keys()].sort();
+          if (availableMonths.length === 0) {
+            throw new Error('No monthly fee documents were found for this class. A complete-history report cannot be established from available records.');
+          }
+          const knownAdmissionMonths = extractStudentsFromClass(classData)
+            .map((student: any) => getStudentAdmissionMonth(student))
+            .filter((month): month is string => Boolean(month))
+            .sort();
+          const earliestKnownAdmission = knownAdmissionMonths[0];
+          const historyStart = earliestKnownAdmission && earliestKnownAdmission < availableMonths[0]
+            ? earliestKnownAdmission
+            : availableMonths[0];
+          const latestAvailable = availableMonths[availableMonths.length - 1];
+          const reportCurrentMonth = getCurrentMonthKey();
+          const historyEnd = latestAvailable > reportCurrentMonth ? latestAvailable : reportCurrentMonth;
+          // Extend through the current month (and any earlier verified admission date) so active
+          // students are not silently omitted just because a monthly document was never created.
+          periodMonths = getMonthsBetween(historyStart, historyEnd);
+        }
+        if (periodMonths.length === 0 || periodMonths.length > MAX_FEE_REPORT_MONTHS) {
+          throw new Error(`The selected report period must contain between 1 and ${MAX_FEE_REPORT_MONTHS} months.`);
+        }
+
+        operationStage = 'historical ledger coverage analysis';
+        operationDomain = 'report processing';
+        const allMonthDocs = [...feeDocsByMonth.values()].sort((a, b) => a.month.localeCompare(b.month));
+        const allAvailableMonthKeys = allMonthDocs.map((feeDoc) => feeDoc.month);
+        const coverageStart = reportScope === 'history' && periodMonths.length
+          ? periodMonths[0]
+          : allAvailableMonthKeys[0];
+        const coverageEnd = reportScope === 'history' && periodMonths.length
+          ? periodMonths[periodMonths.length - 1]
+          : allAvailableMonthKeys[allAvailableMonthKeys.length - 1];
+        const allHistoryMonthKeys = allAvailableMonthKeys.length > 0 && coverageStart && coverageEnd
+          ? getMonthsBetween(coverageStart, coverageEnd)
+          : [];
+        const hasHistoricalCoverageGap = legacyCompatibilityLookupUsed || allHistoryMonthKeys.some((month) => !feeDocsByMonth.has(month));
+        if (allHistoryMonthKeys.some((month) => !feeDocsByMonth.has(month))) {
+          addReportWarning('One or more months within the identified historical coverage have no monthly fee document; historical and period-based totals may not include all fees or receipts.');
+        }
+        const storedReceipts: StoredReportReceipt[] = [];
+        const receiptsByFeeMonth = new Map<string, StoredReportReceipt[]>();
+        const seenReportReceiptKeys = new Map<string, string>();
+        // Read the receipt subcollection below each validated monthly document in small concurrent batches.
+        operationStage = 'payment receipt subcollection retrieval';
+        operationDomain = 'Firestore read';
+        for (let start = 0; start < allMonthDocs.length; start += 6) {
+          const batch = allMonthDocs.slice(start, start + 6);
+          const batchSnapshots = await Promise.all(batch.map(async (feeDoc) => {
+            operationStage = 'payment receipt subcollection query construction';
+            const receiptCollection = collection(db, 'users', tenantEmail, 'fees', feeDoc.docId, 'payments');
+            const receiptQuery = runReportSyncStage(
+              'payment receipt subcollection query construction',
+              'Firestore query construction',
+              () => query(receiptCollection, limit(MAX_FEE_REPORT_RECEIPTS_PER_MONTH + 1)),
+              {
+                pathTemplate: 'users/{verifiedTeacherEmail}/fees/{validatedClassId}_{YYYY-MM}/payments',
+                queryKind: 'collection query with limit',
+                feeMonth: feeDoc.month,
+                monthlyDocumentIdLength: feeDoc.docId.length,
+                maxReceipts: MAX_FEE_REPORT_RECEIPTS_PER_MONTH + 1
+              }
+            );
+            const receiptsSnapshot = await runReportStage(
+              `payment receipt server read for fee month ${feeDoc.month}`,
+              'Firestore read',
+              () => getDocsFromServer(receiptQuery),
+              {
+                pathTemplate: 'users/{verifiedTeacherEmail}/fees/{validatedClassId}_{YYYY-MM}/payments',
+                queryKind: 'collection query with limit',
+                feeMonth: feeDoc.month,
+                monthlyDocumentIdLength: feeDoc.docId.length,
+                maxReceipts: MAX_FEE_REPORT_RECEIPTS_PER_MONTH + 1,
+                readSource: 'server'
+              }
+            );
+            return { feeDoc, receiptsSnapshot };
+          }));
+          const receiptsReadThisBatch = batchSnapshots.reduce((sum, item) => sum + item.receiptsSnapshot.size, 0);
+          if (storedReceipts.length + receiptsReadThisBatch > MAX_FEE_REPORT_RECEIPTS_TOTAL) {
+            throw new Error(`This class has more than ${MAX_FEE_REPORT_RECEIPTS_TOTAL} historical receipts in the queried data. The report was stopped rather than omitting records.`);
+          }
+          operationStage = 'receipt validation and reconciliation';
+          operationDomain = 'Firestore data validation';
+          batchSnapshots.forEach(({ feeDoc, receiptsSnapshot }) => {
+            if (receiptsSnapshot.size > MAX_FEE_REPORT_RECEIPTS_PER_MONTH) {
+              throw new Error(`Fee month ${feeDoc.month} has more than ${MAX_FEE_REPORT_RECEIPTS_PER_MONTH} receipts. The report was stopped rather than silently omitting payment history.`);
+            }
+            const monthReceipts: StoredReportReceipt[] = [];
+            receiptsSnapshot.docs.forEach((receiptSnapshot) => {
+              const receiptData = receiptSnapshot.data() as Record<string, any>;
+              if (receiptData.teacherEmail !== undefined && normalizeTeacherEmail(String(receiptData.teacherEmail)) !== tenantEmail) {
+                throw new Error(`Receipt ${receiptSnapshot.id} is marked for another teacher. The report was not generated.`);
+              }
+              if (receiptData.classId !== undefined && String(receiptData.classId) !== selectedClassId) {
+                throw new Error(`Receipt ${receiptSnapshot.id} is marked for another class. The report was not generated.`);
+              }
+              if (receiptData.month !== undefined && String(receiptData.month) !== feeDoc.month) {
+                addReportWarning(`Receipt ${receiptSnapshot.id} records a fee month that differs from its monthly document path.`);
+              }
+              const studentId = receiptData.studentId === undefined || receiptData.studentId === null ? '' : String(receiptData.studentId).trim();
+              const createdAtDate = parseCalendarDate(receiptData.createdAt);
+              const amount = parseOptionalMoney(receiptData.amount);
+              const appliedToPreviousDues = parseOptionalMoney(receiptData.appliedToPreviousDues);
+              const appliedToCurrentMonth = parseOptionalMoney(receiptData.appliedToCurrentMonth);
+              if (!studentId) addReportWarning(`Receipt ${receiptSnapshot.id} has no student ID and could not be reconciled to a student ledger row.`);
+              if (amount === null) addReportWarning(`Receipt ${receiptSnapshot.id} has an invalid or unavailable amount; report totals may be incomplete.`);
+              if (appliedToPreviousDues === null || appliedToCurrentMonth === null) {
+                addReportWarning(`Receipt ${receiptSnapshot.id} is missing or has invalid allocation fields; allocation history is incomplete.`);
+              } else if (amount !== null && Math.abs(roundMoney(appliedToPreviousDues + appliedToCurrentMonth) - amount) > MONEY_EPSILON) {
+                addReportWarning(`Receipt ${receiptSnapshot.id} allocation amounts do not add up to its stored payment amount; related balances may be incomplete.`);
+              }
+              if (!receiptData.source || typeof receiptData.source !== 'string') addReportWarning(`Receipt ${receiptSnapshot.id} has no recorded transaction source.`);
+              if (!createdAtDate) addReportWarning(`Receipt ${receiptSnapshot.id} has no verifiable payment timestamp; its receipt date cannot be assigned to a reporting period.`);
+              if (receiptData.paymentId !== undefined && String(receiptData.paymentId) !== receiptSnapshot.id) {
+                addReportWarning(`Receipt ${receiptSnapshot.id} has a stored paymentId that differs from its document ID.`);
+              }
+              const receipt: StoredReportReceipt = {
+                paymentId: typeof receiptData.paymentId === 'string' && receiptData.paymentId.trim() ? receiptData.paymentId.trim() : receiptSnapshot.id,
+                studentId,
+                feeMonth: feeDoc.month,
+                amount,
+                appliedToPreviousDues,
+                appliedToCurrentMonth,
+                createdAtDate,
+                paymentDate: createdAtDate ? createdAtDate.toLocaleString() : 'Date unavailable',
+                source: typeof receiptData.source === 'string' && receiptData.source.trim() ? receiptData.source : 'Source unavailable',
+                storedStudentName: String(receiptData.studentName ?? receiptData.name ?? '').trim(),
+                storedRollNo: String(receiptData.rollNo ?? receiptData.roll_no ?? '').trim(),
+                storedGender: String(receiptData.gender ?? '').trim()
+              };
+              const receiptPath = `${feeDoc.docId}/payments/${receiptSnapshot.id}`;
+              for (const identityKey of new Set([receiptSnapshot.id, receipt.paymentId])) {
+                const existingPath = seenReportReceiptKeys.get(identityKey);
+                if (existingPath && existingPath !== receiptPath) {
+                  throw new Error(`Payment identity ${identityKey} appears in more than one monthly payment subcollection. The report was stopped to avoid double-counting receipts.`);
+                }
+                seenReportReceiptKeys.set(identityKey, receiptPath);
+              }
+              monthReceipts.push(receipt);
+              storedReceipts.push(receipt);
+            });
+            receiptsByFeeMonth.set(feeDoc.month, monthReceipts);
+          });
+        }
+
+        if (auth.currentUser?.uid !== uidAtStart || normalizeTeacherEmail(auth.currentUser?.email) !== tenantEmail) {
+          throw new Error('The authenticated teacher changed while report data was being retrieved. No report was produced.');
+        }
+
+        operationStage = 'historical ledger calculations';
+        operationDomain = 'report processing';
+        const currentRoster = extractStudentsFromClass(classData);
+        const rosterById = new Map<string, any>();
+        currentRoster.forEach((student: any) => {
+          const id = getStudentKey(student);
+          if (!id) return;
+          if (rosterById.has(id)) addReportWarning(`The current class roster contains duplicate student ID ${id}.`);
+          else rosterById.set(id, student);
+        });
+        const periodSet = new Set(periodMonths);
+        periodMonths.forEach((month) => {
+          if (!feeDocsByMonth.has(month)) addReportWarning(`No monthly fee document exists for ${month}; fee assessment, balances and payment history for that month cannot be inferred.`);
+        });
+
+        const currentCalendarMonth = getCurrentMonthKey();
+        const reportMonths: FeeReportMonth[] = [];
+        const studentNameFor = (studentId: string, feeMonth: string, raw: any): string => {
+          const rosterStudent = rosterById.get(studentId);
+          const receiptName = (receiptsByFeeMonth.get(feeMonth) || []).find((receipt) => receipt.studentId === studentId && receipt.storedStudentName)?.storedStudentName;
+          const name = String(rosterStudent?.name ?? raw?.studentName ?? raw?.name ?? receiptName ?? '').trim();
+          return name && name.toLowerCase() !== 'unnamed student' ? name : 'Name unavailable';
+        };
+        const reportRosterStudentIsEligible = (student: any, month: string): boolean => {
+          const studentName = String(student?.name ?? '').trim();
+          if (!studentName || studentName.toLowerCase() === 'unnamed student' || !getStudentKey(student)) return false;
+          const admissionMonth = getStudentAdmissionMonth(student);
+          return !admissionMonth || month >= admissionMonth;
+        };
+        const getReportMonthlyFee = (student: any, rawClassData: any): number | null => {
+          const studentSpecificFee = student?.studentFee ?? student?.classFee ?? student?.monthlyFee;
+          if (studentSpecificFee !== undefined && studentSpecificFee !== null && studentSpecificFee !== '') {
+            return parseOptionalMoney(studentSpecificFee);
+          }
+          const classCandidates = [rawClassData?.monthlyFee, rawClassData?.fee, rawClassData?.classFee];
+          for (const candidate of classCandidates) {
+            if (candidate === undefined || candidate === null || candidate === '') continue;
+            const parsed = parseOptionalMoney(candidate);
+            if (parsed !== null) return parsed;
+          }
+          return null;
+        };
+        const sumKnown = (rows: FeeReportStudentRow[], getter: (row: FeeReportStudentRow) => number | null): number | null => {
+          if (rows.length === 0 || rows.some((row) => getter(row) === null)) return null;
+          return roundMoney(rows.reduce((sum, row) => sum + (getter(row) ?? 0), 0));
+        };
+
+        for (const month of periodMonths) {
+          const monthDoc = feeDocsByMonth.get(month);
+          const monthReceipts = receiptsByFeeMonth.get(month) || [];
+          const previousMonth = getMonthOffset(month, -1);
+          const previousDoc = feeDocsByMonth.get(previousMonth);
+          const studentIds = new Set<string>();
+          currentRoster.forEach((student: any) => {
+            const studentId = getStudentKey(student);
+            if (studentId && reportRosterStudentIsEligible(student, month)) studentIds.add(studentId);
+          });
+          if (monthDoc) Object.keys(monthDoc.records).forEach((studentId) => studentIds.add(studentId));
+          monthReceipts.forEach((receipt) => { if (receipt.studentId) studentIds.add(receipt.studentId); });
+          const rows: FeeReportStudentRow[] = [];
+          const orderedIds = [...studentIds].sort(compareStudentKeys);
+
+          orderedIds.forEach((studentId, index) => {
+            const rosterStudent = rosterById.get(studentId);
+            const raw = monthDoc?.records[studentId];
+            const hasMalformedRecord = raw !== undefined && !isPlainObject(raw);
+            const hasRawRecord = Boolean(raw && isPlainObject(raw));
+            if (hasMalformedRecord) addReportWarning(`Fee record for student ID ${studentId} in ${month} is malformed; no totals are inferred from it.`);
+            const studentHasHistory = hasRawRecord || monthReceipts.some((receipt) => receipt.studentId === studentId);
+            if (rosterStudent && !reportRosterStudentIsEligible(rosterStudent, month) && !studentHasHistory) return;
+            const studentReceipts = monthReceipts.filter((receipt) => receipt.studentId === studentId);
+            const validReceiptAmounts = studentReceipts.filter((receipt) => receipt.amount !== null);
+            const hasInvalidReceiptAmount = studentReceipts.some((receipt) => receipt.amount === null);
+            const rawPaidAggregate = hasRawRecord ? parseOptionalMoney(raw.paidAmount) : null;
+            let amountPaid: number | null = null;
+            let legacyAggregate = false;
+            if (!monthDoc || hasMalformedRecord) {
+              amountPaid = null;
+            } else if (studentReceipts.length > 0) {
+              amountPaid = hasInvalidReceiptAmount ? null : roundMoney(validReceiptAmounts.reduce((sum, receipt) => sum + (receipt.amount ?? 0), 0));
+              if (rawPaidAggregate !== null && amountPaid !== null && Math.abs(roundMoney(rawPaidAggregate) - amountPaid) > MONEY_EPSILON) {
+                addReportWarning(`Receipt total and paidAmount aggregate differ for student ${studentId} in ${month}; receipt values are shown separately from the stored aggregate.`);
+              }
+            } else if (rawPaidAggregate !== null) {
+              amountPaid = rawPaidAggregate;
+              if (rawPaidAggregate > MONEY_EPSILON) {
+                legacyAggregate = true;
+                addReportWarning(`Student ${studentId} in ${month} has aggregate paidAmount ${formatPKR(rawPaidAggregate)} but no detailed receipts; transaction-level history is unavailable.`);
+              }
+            } else if (!hasRawRecord) {
+              // The monthly document and its payment subcollection were successfully queried, and no receipt was found for this student.
+              amountPaid = 0;
+            } else {
+              addReportWarning(`Student ${studentId} in ${month} has no usable paidAmount aggregate or detailed receipt amount.`);
+            }
+
+            let assessedFee: number | null = null;
+            if (monthDoc && hasRawRecord && !hasMalformedRecord) {
+              assessedFee = parseOptionalMoney(raw.monthlyFeeDue);
+              if (assessedFee === null && month === currentCalendarMonth && rosterStudent && getStudentAdmissionMonth(rosterStudent) !== month) {
+                assessedFee = getReportMonthlyFee(rosterStudent, classData);
+              }
+            } else if (!hasMalformedRecord && month === currentCalendarMonth && rosterStudent && getStudentAdmissionMonth(rosterStudent) !== month) {
+              assessedFee = getReportMonthlyFee(rosterStudent, classData);
+            }
+            if (monthDoc && assessedFee === null) {
+              addReportWarning(`The assessed fee for student ${studentId} in ${month} is not stored and cannot be verified from current historical records.`);
+            }
+
+            const explicitPreviousDues = hasRawRecord && !hasMalformedRecord && Object.prototype.hasOwnProperty.call(raw, 'previousMonthDues')
+              ? parseOptionalMoney(raw.previousMonthDues)
+              : null;
+            const previousRaw = previousDoc?.records[studentId];
+            const admissionMonth = getStudentAdmissionMonth(rosterStudent || raw || {});
+            let previousDues: number | null = explicitPreviousDues;
+            if (previousDues === null && previousRaw && isPlainObject(previousRaw)) {
+              previousDues = parseOptionalMoney(previousRaw.remainingDues);
+            }
+            if (previousDues === null && admissionMonth && previousMonth < admissionMonth) previousDues = 0;
+            if (previousDues === null && monthDoc && (hasRawRecord || assessedFee !== null)) {
+              addReportWarning(`Previous-month dues for student ${studentId} in ${month} are not recorded on this month or a verifiable previous-month record.`);
+            }
+
+            const totalPayable = !hasMalformedRecord && assessedFee !== null && previousDues !== null
+              ? roundMoney(assessedFee + previousDues)
+              : null;
+            const storedRemaining = hasRawRecord && !hasMalformedRecord ? parseOptionalMoney(raw.remainingDues) : null;
+            let paidTowardsCurrent: number | null = hasRawRecord && !hasMalformedRecord ? parseOptionalMoney(raw.paidTowardsCurrentMonth) : null;
+            if (paidTowardsCurrent === null && storedRemaining !== null && assessedFee !== null && previousDues !== null) {
+              paidTowardsCurrent = Math.min(assessedFee, Math.max(0, roundMoney(totalPayable! - storedRemaining)));
+            } else if (paidTowardsCurrent === null && hasRawRecord && assessedFee !== null && amountPaid !== null) {
+              // Match the existing Fees module's documented legacy allocation fallback.
+              paidTowardsCurrent = Math.min(assessedFee, amountPaid);
+            } else if (paidTowardsCurrent === null && !hasRawRecord && studentReceipts.length > 0) {
+              const currentAllocations = studentReceipts.map((receipt) => receipt.appliedToCurrentMonth);
+              if (currentAllocations.every((amount) => amount !== null)) {
+                paidTowardsCurrent = roundMoney(currentAllocations.reduce((sum, amount) => sum + (amount ?? 0), 0));
+              }
+            }
+
+            let remainingBalance: number | null = storedRemaining;
+            if (remainingBalance === null && totalPayable !== null && studentReceipts.length > 0) {
+              // Receipts are the only safe reconstruction source when a stored balance is absent,
+              // whether or not an incomplete legacy aggregate exists on the monthly record.
+              const previousAllocations = studentReceipts.map((receipt) => receipt.appliedToPreviousDues);
+              const currentAllocations = studentReceipts.map((receipt) => receipt.appliedToCurrentMonth);
+              if (previousAllocations.every((amount) => amount !== null) && currentAllocations.every((amount) => amount !== null)) {
+                const toPrevious = previousAllocations.reduce((sum, amount) => sum + (amount ?? 0), 0);
+                const toCurrent = currentAllocations.reduce((sum, amount) => sum + (amount ?? 0), 0);
+                remainingBalance = Math.max(0, roundMoney(Math.max(0, previousDues! - toPrevious) + Math.max(0, assessedFee! - toCurrent)));
+              }
+            }
+            if (remainingBalance === null && totalPayable !== null && paidTowardsCurrent !== null) {
+              remainingBalance = Math.max(0, roundMoney(totalPayable - paidTowardsCurrent));
+            }
+
+            let status = 'Not recorded';
+            const storedStatus = String(raw?.status ?? '').trim().toUpperCase();
+            const hasValidStoredStatus = storedStatus === 'PAID' || storedStatus === 'PARTIAL' || storedStatus === 'UNPAID';
+            if (totalPayable !== null && remainingBalance !== null) {
+              const inferred = calculateFeeStatus(
+                totalPayable,
+                remainingBalance,
+                (amountPaid ?? 0) > MONEY_EPSILON || (paidTowardsCurrent ?? 0) > MONEY_EPSILON || storedStatus === 'PAID' || storedStatus === 'PARTIAL'
+              );
+              status = inferred === 'PAID' ? 'Paid' : inferred === 'PARTIAL' ? 'Partial' : 'Unpaid';
+              const storedLabel = storedStatus === 'PAID' ? 'Paid' : storedStatus === 'PARTIAL' ? 'Partial' : 'Unpaid';
+              if (hasValidStoredStatus && storedLabel !== status) {
+                addReportWarning(`Stored status ${storedLabel} differs from the balance-derived status ${status} for student ${studentId} in ${month}; the report uses the status derived from the recorded balance.`);
+              }
+            } else if (hasValidStoredStatus) {
+              status = storedStatus === 'PAID' ? 'Paid' : storedStatus === 'PARTIAL' ? 'Partial' : 'Unpaid';
+            }
+            if (!monthDoc || hasMalformedRecord) status = 'Not recorded';
+            if (hasMalformedRecord) {
+              assessedFee = null;
+              previousDues = null;
+              amountPaid = null;
+              remainingBalance = null;
+              legacyAggregate = false;
+            }
+            if (!hasRawRecord && monthDoc && (assessedFee === null || previousDues === null || remainingBalance === null)) {
+              if (status !== 'Unpaid') status = 'Not recorded';
+            }
+            if (!hasRawRecord && monthDoc && assessedFee !== null && previousDues !== null && remainingBalance !== null && amountPaid === 0) status = 'Unpaid';
+            if (status === 'Not recorded') addReportWarning(`Student ${studentId} has no complete fee ledger row for ${month}; the report does not infer a zero balance.`);
+
+            const datedStudentReceipts = studentReceipts.filter((receipt) => receipt.createdAtDate !== null)
+              .sort((a, b) => (b.createdAtDate?.getTime() || 0) - (a.createdAtDate?.getTime() || 0));
+            const latestPaymentDate = datedStudentReceipts[0]?.paymentDate || 'N/A';
+            const receiptForIdentity = studentReceipts.find((receipt) => receipt.storedStudentName || receipt.storedRollNo || receipt.storedGender);
+            const name = studentNameFor(studentId, month, raw);
+            if (name === 'Name unavailable') {
+              addReportWarning(`A historical student name is unavailable for student ID ${studentId} in ${month}; the ID is retained without inventing a name.`);
+            }
+            const row: FeeReportStudentRow = {
+              serial: rows.length + 1,
+              rollNo: String(rosterStudent?.rollNo ?? rosterStudent?.roll_no ?? rosterStudent?.roll ?? raw?.rollNo ?? raw?.roll_no ?? receiptForIdentity?.storedRollNo ?? 'N/A'),
+              studentName: name,
+              studentId,
+              gender: String(rosterStudent?.gender ?? raw?.gender ?? receiptForIdentity?.storedGender ?? 'N/A'),
+              month,
+              assessedFee,
+              previousDues,
+              totalPayable,
+              amountPaid,
+              remainingBalance,
+              status,
+              latestPaymentDate,
+              legacyAggregate
+            };
+            rows.push(row);
+          });
+
+          const monthReceiptAmountsInvalid = monthReceipts.some((receipt) => receipt.amount === null || !receipt.studentId);
+          const monthRecordAggregatesUnusable = monthDoc ? Object.entries(monthDoc.records).some(([studentId, raw]) => {
+            const hasReceiptsForStudent = monthReceipts.some((receipt) => receipt.studentId === studentId);
+            return !hasReceiptsForStudent && parseOptionalMoney(raw?.paidAmount) === null;
+          }) : false;
+          let collectedByFeeMonth: number | null = null;
+          if (monthDoc && !monthReceiptAmountsInvalid && !monthRecordAggregatesUnusable) {
+            let collected = monthReceipts.reduce((sum, receipt) => sum + (receipt.amount ?? 0), 0);
+            Object.entries(monthDoc.records).forEach(([studentId, raw]) => {
+              const hasReceiptsForStudent = monthReceipts.some((receipt) => receipt.studentId === studentId);
+              if (hasReceiptsForStudent) return;
+              const aggregate = parseOptionalMoney(raw?.paidAmount);
+              if (aggregate !== null) collected += aggregate;
+            });
+            collectedByFeeMonth = roundMoney(collected);
+          }
+          const assessedTotal = sumKnown(rows, (row) => row.assessedFee);
+          const previousDuesTotal = sumKnown(rows, (row) => row.previousDues);
+          const outstandingTotal = sumKnown(rows, (row) => row.remainingBalance);
+          const monthModel: FeeReportMonth = {
+            month,
+            hasDocument: Boolean(monthDoc),
+            rows,
+            assessedTotal,
+            paidCount: rows.filter((row) => row.status === 'Paid').length,
+            partialCount: rows.filter((row) => row.status === 'Partial').length,
+            unpaidCount: rows.filter((row) => row.status === 'Unpaid').length,
+            unrecordedCount: rows.filter((row) => row.status === 'Not recorded').length,
+            previousDuesTotal,
+            collectedByFeeMonth,
+            outstandingTotal
+          };
+          if (!monthDoc) {
+            monthModel.previousDuesTotal = null;
+            monthModel.outstandingTotal = null;
+          }
+          reportMonths.push(monthModel);
+        }
+
+        const reportStart = periodMonths[0];
+        const reportEnd = periodMonths[periodMonths.length - 1];
+        const transactionRows = storedReceipts.filter((receipt) => {
+          if (reportScope === 'history') return true;
+          if (periodSet.has(receipt.feeMonth)) return true;
+          if (receipt.createdAtDate) {
+            const createdMonth = `${receipt.createdAtDate.getFullYear()}-${String(receipt.createdAtDate.getMonth() + 1).padStart(2, '0')}`;
+            return createdMonth >= reportStart && createdMonth <= reportEnd;
+          }
+          return false;
+        }).map((receipt): FeeReportTransaction => {
+          const raw = feeDocsByMonth.get(receipt.feeMonth)?.records[receipt.studentId];
+          const studentName = studentNameFor(receipt.studentId, receipt.feeMonth, raw);
+          if (receipt.studentId && studentName === 'Name unavailable') {
+            addReportWarning(`The historical name for student ${receipt.studentId} in a payment receipt is unavailable; the student ID is retained.`);
+          }
+          return {
+            paymentDate: receipt.paymentDate,
+            createdAtDate: receipt.createdAtDate,
+            paymentId: receipt.paymentId,
+            studentName,
+            studentId: receipt.studentId || 'Student ID unavailable',
+            feeMonth: receipt.feeMonth,
+            amount: receipt.amount,
+            appliedToPreviousDues: receipt.appliedToPreviousDues,
+            appliedToCurrentMonth: receipt.appliedToCurrentMonth,
+            source: receipt.source
+          };
+        }).sort((a, b) => (a.createdAtDate?.getTime() || 0) - (b.createdAtDate?.getTime() || 0));
+
+        let collectionsReceivedDuringPeriod: number | null = null;
+        const anyUnassignableReceipt = storedReceipts.some((receipt) => !receipt.createdAtDate || receipt.amount === null || !receipt.studentId);
+        const missingPeriodFeeDocument = periodMonths.some((month) => !feeDocsByMonth.has(month));
+        if (!anyUnassignableReceipt && !missingPeriodFeeDocument && !hasHistoricalCoverageGap) {
+          collectionsReceivedDuringPeriod = roundMoney(storedReceipts.reduce((sum, receipt) => {
+            if (!receipt.createdAtDate || receipt.amount === null) return sum;
+            const createdMonth = `${receipt.createdAtDate.getFullYear()}-${String(receipt.createdAtDate.getMonth() + 1).padStart(2, '0')}`;
+            return createdMonth >= reportStart && createdMonth <= reportEnd ? sum + receipt.amount : sum;
+          }, 0));
+        }
+
+        const sumLegacyForMonths = (monthsToSum: Set<string>): number | null => {
+          // A sum across an incomplete period is not a verified period total.
+          if ([...monthsToSum].some((month) => !feeDocsByMonth.has(month))) return null;
+          let total = 0;
+          for (const [month, monthDoc] of feeDocsByMonth.entries()) {
+            if (!monthsToSum.has(month)) continue;
+            const monthReceipts = receiptsByFeeMonth.get(month) || [];
+            for (const [studentId, raw] of Object.entries(monthDoc.records)) {
+              if (monthReceipts.some((receipt) => receipt.studentId === studentId)) continue;
+              const aggregate = parseOptionalMoney((raw as any)?.paidAmount);
+              if (aggregate === null) return null;
+              total += aggregate;
+            }
+          }
+          return roundMoney(total);
+        };
+        const legacyAggregateForPeriod = sumLegacyForMonths(periodSet);
+
+        let cumulativeRecordedPayments: number | null = (storedReceipts.some((receipt) => !receipt.studentId) || hasHistoricalCoverageGap) ? null : 0;
+        for (const [month, monthDoc] of feeDocsByMonth.entries()) {
+          if (cumulativeRecordedPayments === null) break;
+          const monthReceipts = receiptsByFeeMonth.get(month) || [];
+          const ids = new Set([...Object.keys(monthDoc.records), ...monthReceipts.map((receipt) => receipt.studentId).filter(Boolean)]);
+          for (const studentId of ids) {
+            const receiptList = monthReceipts.filter((receipt) => receipt.studentId === studentId);
+            if (receiptList.length) {
+              if (receiptList.some((receipt) => receipt.amount === null)) { cumulativeRecordedPayments = null; break; }
+              cumulativeRecordedPayments = (cumulativeRecordedPayments ?? 0) + receiptList.reduce((sum, receipt) => sum + (receipt.amount ?? 0), 0);
+            } else {
+              const aggregate = parseOptionalMoney(monthDoc.records[studentId]?.paidAmount);
+              if (aggregate === null) { cumulativeRecordedPayments = null; break; }
+              cumulativeRecordedPayments = (cumulativeRecordedPayments ?? 0) + aggregate;
+            }
+          }
+          if (cumulativeRecordedPayments === null) break;
+        }
+        if (cumulativeRecordedPayments !== null) cumulativeRecordedPayments = roundMoney(cumulativeRecordedPayments);
+
+        const endingMonth = reportMonths[reportMonths.length - 1];
+        const assessedFees = reportMonths.every((month) => month.assessedTotal !== null)
+          ? roundMoney(reportMonths.reduce((sum, month) => sum + (month.assessedTotal ?? 0), 0))
+          : null;
+        const unsupportedPdfCharacters = [className, tenantEmail, ...reportMonths.flatMap((month) => month.rows.map((row) => row.studentName)), ...transactionRows.map((row) => row.studentName)]
+          .some((value) => [...value].some((character) => pdfWinAnsiByte(character) === null));
+        if (unsupportedPdfCharacters) {
+          addReportWarning('The downloaded PDF uses built-in Latin/WinAnsi fonts; characters outside that encoding may appear as question marks. The Print action uses browser-rendered report HTML and may preserve the original script.');
+        }
+        if (warningsTruncated) warnings.add('Additional data-quality notes were omitted after the report note limit was reached.');
+        const isComplete = !hasDataGaps && warnings.size === 0 && !warningsTruncated;
+        const model: FeeReportModel = {
+          title: reportScope === 'history' && isComplete ? 'Complete Fee History' : reportScope === 'history' ? 'Fee History Report — Data Limitations' : 'Student Fee Report',
+          className,
+          classId: selectedClassId,
+          teacherEmail: tenantEmail,
+          scope: reportScope,
+          periodLabel: periodMonths.length === 1
+            ? formatMonthLabel(periodMonths[0])
+            : `${formatMonthLabel(reportStart)} – ${formatMonthLabel(reportEnd)}`,
+          generatedAt: new Date().toLocaleString(),
+          months: reportMonths,
+          transactions: transactionRows,
+          warnings: [...warnings],
+          isComplete,
+          totals: {
+            eligibleStudents: endingMonth?.rows.length ?? 0,
+            paidCount: endingMonth?.paidCount ?? 0,
+            partialCount: endingMonth?.partialCount ?? 0,
+            unpaidCount: endingMonth?.unpaidCount ?? 0,
+            unrecordedCount: endingMonth?.unrecordedCount ?? 0,
+            assessedFees,
+            collectionsReceivedDuringPeriod,
+            legacyAggregateForPeriod,
+            cumulativeRecordedPayments,
+            previousDuesAtEnd: endingMonth?.previousDuesTotal ?? null,
+            outstandingAtEnd: endingMonth?.outstandingTotal ?? null
+          }
+        };
+        const pdfBytes = runReportSyncStage(
+          'PDF byte generation',
+          'PDF generation',
+          () => buildFeeReportPdf(model),
+          { generator: 'buildFeeReportPdf', format: 'application/pdf', monthCount: model.months.length, studentLedgerRowCount: model.months.reduce((sum, month) => sum + month.rows.length, 0), receiptRowCount: model.transactions.length }
+        );
+        const blob = runReportSyncStage(
+          'PDF Blob creation',
+          'PDF generation',
+          () => new Blob([pdfBytes], { type: 'application/pdf' }),
+          { type: 'application/pdf', byteLength: pdfBytes.byteLength }
+        );
+        reportPackage = { model, blob, filename: reportFilename(model), signature: currentReportSignature() };
+        setGeneratedReport(reportPackage);
+      }
+
+      operationStage = 'authenticated report delivery validation';
+      operationDomain = 'tenant security validation';
+      if (!auth.currentUser || normalizeTeacherEmail(auth.currentUser.email) !== reportPackage.model.teacherEmail || currentUserEmail !== reportPackage.model.teacherEmail) {
+        throw new Error('The signed-in teacher changed before the report could be delivered. Generate the report again under the verified account.');
+      }
+      if (action === 'download') {
+        operationStage = 'PDF download delivery';
+        operationDomain = 'PDF delivery';
+        const objectUrl = URL.createObjectURL(reportPackage.blob);
+        const link = document.createElement('a');
+        link.href = objectUrl;
+        link.download = reportPackage.filename;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 30000);
+        showNotification('success', `Fee report PDF generated: ${reportPackage.filename}`);
+      } else if (printWindow) {
+        operationStage = 'PDF print-report HTML delivery';
+        operationDomain = 'PDF delivery';
+        printWindow.onload = () => {
+          printWindow?.focus();
+          printWindow?.print();
+        };
+        printWindow.document.open();
+        printWindow.document.write(reportHtml(reportPackage.model));
+        printWindow.document.close();
+      }
+    } catch (error: any) {
+      const message = getFriendlyErrorMessage(error);
+      const savedContext = typeof error === 'object' && error !== null
+        ? reportFailureContexts.get(error)
+        : undefined;
+      const failedStage = savedContext?.stage || operationStage;
+      const failedDomain = savedContext?.domain || operationDomain;
+      const rawCode = error?.code ?? null;
+      const normalizedCode = normalizeFirebaseErrorCode(rawCode);
+      const rawMessage = error instanceof Error ? error.message : String(error?.message ?? error ?? 'Unknown report-generation error');
+      const errorName = error?.name ?? (error === null ? 'null' : typeof error);
+      const errorStack = typeof error?.stack === 'string' ? error.stack : null;
+      const failureCategory = /Firestore/.test(failedDomain) || /Firestore|fee documents|receipt server read|subcollection query/i.test(failedStage)
+        ? 'Firestore record retrieval/query'
+        : /PDF/.test(failedDomain) || /PDF|download|print/i.test(failedStage)
+          ? 'PDF generation/delivery'
+          : /authentication|tenant/i.test(failedDomain)
+            ? 'authentication/tenant verification'
+            : 'report validation/ledger processing';
+      console.error('[Fees] Report generation failed — diagnostic details:', {
+        operationStage: failedStage,
+        failureDomain: failedDomain,
+        failureCategory,
+        errorCode: rawCode,
+        normalizedErrorCode: normalizedCode,
+        errorMessage: rawMessage,
+        userFacingMessage: message,
+        errorName,
+        errorStack,
+        queryDiagnostics: savedContext?.diagnostics || activeQueryDiagnostics,
+        reportScope: reportScope,
+        classIdLength: selectedClassId.length,
+        selectedMonthFormatValid: isValidMonthKey(selectedMonth),
+        rangeStartFormatValid: isValidMonthKey(reportStartMonth),
+        rangeEndFormatValid: isValidMonthKey(reportEndMonth),
+        action,
+        cursorQueryCompatibilityFallbackUsed: legacyCompatibilityLookupUsed
+      });
+      setReportError(message);
+      showNotification('error', `Fee report could not be generated. ${message}`);
+      // Never leave an error document in a tab that the user may mistake for a report
+      // or accidentally print. Only a successfully generated report is sent to print.
+      if (printWindow && !printWindow.closed) printWindow.close();
+    } finally {
+      reportInFlightRef.current = false;
+      setIsReportGenerating(false);
     }
   };
 
@@ -1435,6 +3095,17 @@ export default function Fees() {
   return (
     <div className={`min-h-screen bg-[#f8fafc] dark:bg-[#070c18] text-slate-900 dark:text-slate-100 transition-colors duration-300 pb-36 ${isDark ? 'dark' : ''}`}>
 
+      {notification && (
+        <div role={notification.kind === 'error' ? 'alert' : 'status'} aria-live={notification.kind === 'error' ? 'assertive' : 'polite'} className={`fixed top-4 left-1/2 -translate-x-1/2 z-[120] w-[calc(100%-2rem)] max-w-lg rounded-2xl border px-4 py-3 shadow-[0_0_30px_rgba(249,115,22,0.22)] backdrop-blur-xl flex items-start gap-3 ${notification.kind === 'success' ? 'bg-emerald-600 text-white border-emerald-300' : notification.kind === 'error' ? 'bg-rose-600 text-white border-rose-300' : notification.kind === 'warning' ? 'bg-amber-500 text-white border-amber-300' : 'bg-slate-900 text-white border-slate-600'}`}>
+          {notification.kind === 'success' ? <CheckCircle2 className="h-5 w-5 shrink-0 mt-0.5" /> : notification.kind === 'error' ? <XCircle className="h-5 w-5 shrink-0 mt-0.5" /> : <RefreshCw className="h-5 w-5 shrink-0 mt-0.5" />}
+          <div className="min-w-0 flex-1 text-xs sm:text-sm font-bold leading-relaxed">{notification.message}</div>
+          {(feeDataStatus === 'error' || classDataStatus === 'error') && (
+            <button type="button" onClick={() => { setNotification(null); if (classDataStatus === 'error') setClassRetryCount((value) => value + 1); else setFeeRetryCount((value) => value + 1); }} title={feeDataError || 'Retry server verification'} className="shrink-0 rounded-lg border border-white/40 px-2.5 py-1 text-xs font-black hover:bg-white/10">Retry</button>
+          )}
+          <button type="button" aria-label="Dismiss notification" onClick={() => setNotification(null)} className="shrink-0 rounded-lg p-1 hover:bg-white/10"><X className="h-4 w-4" /></button>
+        </div>
+      )}
+
       {/* TOP HEADER */}
       <div className="w-full bg-white/60 dark:bg-[#080e1e]/80 backdrop-blur-md border-b border-slate-200/60 dark:border-slate-800/80 sticky top-0 z-40">
         <div className="mx-auto max-w-7xl flex h-14 items-center justify-between px-4 sm:px-6 lg:px-8">
@@ -1457,6 +3128,17 @@ export default function Fees() {
               <Layers className="h-3.5 w-3.5" />
               <span>Extra Charges</span>
             </Link>
+
+            <button
+              type="button"
+              onClick={openReportConfiguration}
+              disabled={!currentUserEmail || !selectedClassId || classDataStatus !== 'ready' || isReportGenerating}
+              aria-label="Print Report"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 text-white font-extrabold text-xs shadow-[0_0_18px_rgba(249,115,22,0.35)] hover:scale-105 transition-all shrink-0 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <FileText className="h-3.5 w-3.5" />
+              <span>Print Report</span>
+            </button>
 
             <button
               onClick={() => setIsDark(!isDark)}
@@ -1489,7 +3171,7 @@ export default function Fees() {
               <div>
                 <h2 className="text-xl font-black tracking-tight md:text-2xl flex items-center gap-2 text-slate-900 dark:text-white">
                   Fees Register
-                  {isLoading && (
+                  {(isLoadingClasses || feeDataStatus === 'loading') && (
                     <RefreshCw className="h-4 w-4 animate-spin text-orange-500 drop-shadow-[0_0_8px_rgba(249,115,22,0.8)] ml-1" />
                   )}
                 </h2>
@@ -1505,15 +3187,15 @@ export default function Fees() {
 
             <div className="flex items-center gap-2 bg-slate-100/90 dark:bg-[#060b16]/80 p-1.5 rounded-xl border border-slate-200/80 dark:border-slate-800/80 self-start sm:self-auto backdrop-blur-md shadow-inner">
               <button
-                onClick={markAllPaid}
-                disabled={classes.length === 0}
+                onClick={() => requestBulkAction('paid')}
+                disabled={classes.length === 0 || feeDataStatus !== 'ready' || isBulkProcessing}
                 className="flex items-center gap-1.5 text-[11px] font-bold px-3.5 py-1.5 rounded-lg bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/20 border border-emerald-500/30 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <CheckCircle2 className="h-3.5 w-3.5" /> Mark All Paid
               </button>
               <button
-                onClick={markAllUnpaid}
-                disabled={classes.length === 0}
+                onClick={() => requestBulkAction('unpaid')}
+                disabled={classes.length === 0 || feeDataStatus !== 'ready' || isBulkProcessing}
                 className="flex items-center gap-1.5 text-[11px] font-bold px-3.5 py-1.5 rounded-lg bg-rose-500/10 text-rose-600 dark:text-rose-400 hover:bg-rose-500/20 border border-rose-500/30 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <XCircle className="h-3.5 w-3.5" /> Mark All Unpaid
@@ -1573,7 +3255,7 @@ export default function Fees() {
                     <DollarSign className="h-5 w-5" />
                   </div>
                   <div className="text-base font-black text-slate-800 dark:text-slate-100 mt-2">
-                    PKR {totalCollectedPKR.toLocaleString()}
+                    PKR {feeDataStatus === 'ready' ? totalCollectedPKR.toLocaleString() : '—'}
                   </div>
                   <div className="text-[10px] text-emerald-600 dark:text-emerald-400 font-extrabold uppercase tracking-wider">Collected This Month</div>
                 </div>
@@ -1583,7 +3265,7 @@ export default function Fees() {
         </div>
 
         {/* NO CLASS NOTICE */}
-        {classes.length === 0 && !isLoading && (
+        {classes.length === 0 && !isLoadingClasses && (
           <div className="relative overflow-hidden rounded-2xl p-[2px] border-2 border-orange-500 shadow-[0_0_25px_rgba(249,115,22,0.35)]">
             <div className="bg-white dark:bg-[#0a1020] p-6 rounded-[14px] text-center space-y-3">
               <div className="mx-auto w-12 h-12 rounded-full bg-orange-500/10 border border-orange-500/40 flex items-center justify-center text-orange-500">
@@ -1613,23 +3295,23 @@ export default function Fees() {
           </div>
           <div className="bg-emerald-50/70 dark:bg-emerald-950/20 border-2 border-emerald-500/40 rounded-2xl p-3.5 shadow-[0_0_15px_rgba(16,185,129,0.15)]">
             <span className="text-[10px] font-extrabold text-emerald-600 dark:text-emerald-400 block tracking-wide uppercase">Paid Count</span>
-            <span className="text-xl sm:text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1 block">{paidCount}</span>
+            <span className="text-xl sm:text-2xl font-black text-emerald-600 dark:text-emerald-400 mt-1 block">{feeDataStatus === 'ready' ? paidCount : '—'}</span>
           </div>
           <div className="bg-rose-50/70 dark:bg-rose-950/20 border-2 border-rose-500/40 rounded-2xl p-3.5 shadow-[0_0_15px_rgba(244,63,94,0.15)]">
             <span className="text-[10px] font-extrabold text-rose-600 dark:text-rose-400 block tracking-wide uppercase">Unpaid Count</span>
-            <span className="text-xl sm:text-2xl font-black text-rose-600 dark:text-rose-400 mt-1 block">{unpaidCount}</span>
+            <span className="text-xl sm:text-2xl font-black text-rose-600 dark:text-rose-400 mt-1 block">{feeDataStatus === 'ready' ? unpaidCount : '—'}</span>
           </div>
           <div className="bg-blue-50/70 dark:bg-blue-950/20 border-2 border-blue-500/40 rounded-2xl p-3.5 shadow-[0_0_15px_rgba(59,130,246,0.15)]">
             <span className="text-[10px] font-extrabold text-blue-600 dark:text-blue-400 block tracking-wide uppercase">Collected</span>
-            <span className="text-base sm:text-lg font-black text-blue-600 dark:text-blue-400 mt-1 block truncate">PKR {totalCollectedPKR.toLocaleString()}</span>
+            <span className="text-base sm:text-lg font-black text-blue-600 dark:text-blue-400 mt-1 block truncate">PKR {feeDataStatus === 'ready' ? totalCollectedPKR.toLocaleString() : '—'}</span>
           </div>
           <div className="bg-amber-50/70 dark:bg-amber-950/20 border-2 border-amber-500/40 rounded-2xl p-3.5 shadow-[0_0_15px_rgba(245,158,11,0.15)]">
             <span className="text-[10px] font-extrabold text-amber-600 dark:text-amber-400 block tracking-wide uppercase">Pending Dues</span>
-            <span className="text-base sm:text-lg font-black text-amber-600 dark:text-amber-400 mt-1 block truncate">PKR {totalPendingDuesPKR.toLocaleString()}</span>
+            <span className="text-base sm:text-lg font-black text-amber-600 dark:text-amber-400 mt-1 block truncate">PKR {feeDataStatus === 'ready' ? totalPendingDuesPKR.toLocaleString() : '—'}</span>
           </div>
           <div className="bg-purple-50/70 dark:bg-purple-950/20 border-2 border-purple-500/40 rounded-2xl p-3.5 shadow-[0_0_15px_rgba(168,85,247,0.15)]">
             <span className="text-[10px] font-extrabold text-purple-600 dark:text-purple-400 block tracking-wide uppercase">Prev Month Dues</span>
-            <span className="text-base sm:text-lg font-black text-purple-600 dark:text-purple-400 mt-1 block truncate">PKR {totalPrevMonthDuesPKR.toLocaleString()}</span>
+            <span className="text-base sm:text-lg font-black text-purple-600 dark:text-purple-400 mt-1 block truncate">PKR {feeDataStatus === 'ready' ? totalPrevMonthDuesPKR.toLocaleString() : '—'}</span>
           </div>
         </div>
 
@@ -1671,7 +3353,7 @@ export default function Fees() {
                   : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              Paid ({paidCount})
+              Paid ({feeDataStatus === 'ready' ? paidCount : '—'})
             </button>
 
             <button
@@ -1682,7 +3364,7 @@ export default function Fees() {
                   : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              Unpaid ({unpaidCount})
+              Unpaid ({feeDataStatus === 'ready' ? unpaidCount : '—'})
             </button>
 
             <button
@@ -1693,14 +3375,23 @@ export default function Fees() {
                   : 'text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
-              Partial ({partialCount})
+              Partial ({feeDataStatus === 'ready' ? partialCount : '—'})
             </button>
           </div>
         </div>
 
         {/* STUDENT FEE CARDS LIST */}
         <div className="space-y-3.5">
-          {paginatedStudents.length === 0 ? (
+          {feeDataStatus !== 'ready' ? (
+            <div className="rounded-2xl border-2 border-orange-500/40 bg-white p-6 text-center shadow-[0_0_18px_rgba(249,115,22,0.12)] dark:bg-[#0a1020]">
+              <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-orange-500/10 text-orange-500">
+                {feeDataStatus === 'loading' ? <RefreshCw className="h-5 w-5 animate-spin" /> : <XCircle className="h-5 w-5" />}
+              </div>
+              <h3 className="text-sm font-black text-slate-900 dark:text-white">{classDataStatus === 'error' ? 'Class data could not be verified' : feeDataStatus === 'loading' ? 'Verifying fee records...' : 'Fee records could not be verified'}</h3>
+              <p className="mx-auto mt-1 max-w-lg text-xs leading-relaxed text-slate-500 dark:text-slate-400">{classDataStatus === 'error' ? (feeDataError || 'Class data could not be verified. Retry the class read.') : feeDataStatus === 'loading' ? 'Waiting for server-confirmed current- and previous-month records. Payment and bulk actions remain unavailable until verification completes.' : (feeDataError || 'The current and previous fee registers could not be verified. Retry the server read before recording a payment.')}</p>
+              {(feeDataStatus === 'error' || classDataStatus === 'error') && <button type="button" onClick={() => { notifiedReadErrorRef.current = null; setNotification(null); if (classDataStatus === 'error' && !currentUserEmail) setAuthRetryCount((value) => value + 1); else if (classDataStatus === 'error') setClassRetryCount((value) => value + 1); else setFeeRetryCount((value) => value + 1); }} className="mt-4 inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 px-4 py-2 text-xs font-black text-white shadow-md"><RefreshCw className="h-3.5 w-3.5" /> Retry Verification</button>}
+            </div>
+          ) : paginatedStudents.length === 0 ? (
             <div className="text-center py-12 bg-white dark:bg-[#0a1020] rounded-2xl border-2 border-orange-500/40 shadow-[0_0_15px_rgba(249,115,22,0.15)]">
               <p className="text-xs font-bold text-slate-400">
                 {classes.length === 0 ? 'No classes available to load students.' : 'No students found for this month/filters.'}
@@ -2125,11 +3816,112 @@ export default function Fees() {
 
               <button 
                 onClick={handleSaveModalPayment}
-                className="w-full mt-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-black py-3.5 rounded-2xl transition-all duration-200 shadow-[0_4px_25px_rgba(249,115,22,0.4)] flex justify-center items-center gap-2 text-sm tracking-wide"
+                disabled={isPaymentSaving || feeDataStatus !== 'ready'}
+                aria-busy={isPaymentSaving}
+                className="w-full mt-2 bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-white font-black py-3.5 rounded-2xl transition-all duration-200 shadow-[0_4px_25px_rgba(249,115,22,0.4)] flex justify-center items-center gap-2 text-sm tracking-wide disabled:opacity-60 disabled:cursor-not-allowed"
               >
-                <Save className="h-5 w-5" /> Save Record
+                {isPaymentSaving ? <RefreshCw className="h-5 w-5 animate-spin" /> : <Save className="h-5 w-5" />} {isPaymentSaving ? 'Saving Payment...' : 'Save Record'}
               </button>
 
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* BULK FINANCIAL ACTION CONFIRMATION */}
+      {bulkConfirmation && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md" role="dialog" aria-modal="true" aria-labelledby="bulk-confirm-title">
+          <div className="w-full max-w-lg rounded-3xl border-2 border-orange-500 bg-white p-6 shadow-[0_0_50px_rgba(249,115,22,0.35)] dark:bg-[#0a1020]">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div>
+                <h3 id="bulk-confirm-title" className="text-lg font-black text-slate-900 dark:text-white">{bulkConfirmation.action === 'paid' ? 'Confirm Mark All Paid' : 'Confirm Mark All Unpaid'}</h3>
+                <p className="mt-1 text-xs font-semibold text-slate-500 dark:text-slate-400">Review the complete eligible class population before committing.</p>
+              </div>
+              <button type="button" disabled={isBulkProcessing} onClick={() => setBulkConfirmation(null)} aria-label="Cancel bulk action" className="rounded-full bg-slate-100 p-2 text-slate-500 disabled:opacity-50 dark:bg-slate-800"><X className="h-4 w-4" /></button>
+            </div>
+            <div className="space-y-3 rounded-2xl border border-orange-500/30 bg-orange-500/5 p-4 text-sm dark:bg-orange-500/10">
+              <div className="flex justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Class</span><strong className="text-right text-slate-900 dark:text-white">{bulkConfirmation.className}</strong></div>
+              <div className="flex justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Fee month</span><strong className="text-slate-900 dark:text-white">{bulkConfirmation.month}</strong></div>
+              <div className="flex justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Eligible students</span><strong className="text-slate-900 dark:text-white">{bulkConfirmation.studentCount}</strong></div>
+              {bulkConfirmation.action === 'paid' && <div className="flex justify-between gap-4 border-t border-orange-500/20 pt-3"><span className="text-slate-500 dark:text-slate-400">Estimated collected (PKR)</span><strong className="text-right text-emerald-600 dark:text-emerald-400">{bulkConfirmation.estimatedTotal.toLocaleString()}</strong></div>}
+            </div>
+            <p className="mt-4 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+              {bulkConfirmation.action === 'paid'
+                ? 'This operation records the full authoritative outstanding balance for every eligible student, creates one payment receipt for each positive balance, allocates payments to previous-month dues first, updates fee balances and student fee statuses, and commits the writes atomically. If the server-side total or student population differs from this confirmation, the entire operation is cancelled.'
+                : 'This operation sets eligible students to Unpaid only when none of them has payment history. It will not erase collected money or partially update the class; if any affected record has payment history, the entire transaction is rejected.'}
+            </p>
+            <div className="mt-5 flex gap-3">
+              <button type="button" disabled={isBulkProcessing} onClick={() => setBulkConfirmation(null)} className="flex-1 rounded-xl border border-slate-300 px-4 py-3 text-xs font-black text-slate-600 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300">Cancel</button>
+              <button type="button" disabled={isBulkProcessing || feeDataStatus !== 'ready'} onClick={() => { const confirmation = bulkConfirmation; if (!confirmation) return; if (confirmation.action === 'paid') void markAllPaid(confirmation); else void markAllUnpaid(confirmation); }} className="flex-1 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 px-4 py-3 text-xs font-black text-white shadow-[0_0_18px_rgba(249,115,22,0.3)] disabled:cursor-not-allowed disabled:opacity-60">{isBulkProcessing ? 'Processing...' : 'Confirm & Commit'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      {/* REPORT CONFIGURATION AND PDF ACTIONS */}
+      {isReportModalOpen && (
+        <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md" role="dialog" aria-modal="true" aria-labelledby="fee-report-title">
+          <div className="w-full max-w-2xl max-h-[90vh] overflow-y-auto rounded-3xl border-2 border-orange-500/70 bg-white p-5 sm:p-6 shadow-[0_0_55px_rgba(249,115,22,0.3)] dark:bg-[#0a1020]">
+            <div className="mb-5 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-gradient-to-br from-orange-500 to-amber-500 text-white shadow-[0_0_18px_rgba(249,115,22,0.3)]"><FileText className="h-5 w-5" /></div>
+                <div>
+                  <h3 id="fee-report-title" className="text-lg font-black text-slate-900 dark:text-white">Premium Fee Report</h3>
+                  <p className="mt-1 text-xs leading-relaxed text-slate-500 dark:text-slate-400">Generate a searchable PDF from server-confirmed records belonging to the signed-in teacher.</p>
+                </div>
+              </div>
+              <button type="button" disabled={isReportGenerating} onClick={() => setIsReportModalOpen(false)} aria-label="Close report configuration" className="rounded-full bg-slate-100 p-2 text-slate-500 disabled:opacity-50 dark:bg-slate-800"><X className="h-4 w-4" /></button>
+            </div>
+
+            <div className="mb-4 grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <button type="button" disabled={isReportGenerating} onClick={() => { setReportScope('selected'); setGeneratedReport(null); setReportError(null); }} className={`rounded-2xl border p-3 text-left transition-all ${reportScope === 'selected' ? 'border-orange-500 bg-orange-500/10 shadow-[0_0_14px_rgba(249,115,22,0.12)]' : 'border-slate-200 hover:border-orange-400 dark:border-slate-700'}`}>
+                <strong className="block text-xs font-black text-slate-900 dark:text-white">Selected Month</strong><span className="mt-1 block text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">Current selected class and fee month.</span>
+              </button>
+              <button type="button" disabled={isReportGenerating} onClick={() => { setReportScope('history'); setGeneratedReport(null); setReportError(null); }} className={`rounded-2xl border p-3 text-left transition-all ${reportScope === 'history' ? 'border-orange-500 bg-orange-500/10 shadow-[0_0_14px_rgba(249,115,22,0.12)]' : 'border-slate-200 hover:border-orange-400 dark:border-slate-700'}`}>
+                <strong className="block text-xs font-black text-slate-900 dark:text-white">Complete Fee History</strong><span className="mt-1 block text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">All available monthly fee documents for this class.</span>
+              </button>
+              <button type="button" disabled={isReportGenerating} onClick={() => { setReportScope('range'); setGeneratedReport(null); setReportError(null); }} className={`rounded-2xl border p-3 text-left transition-all ${reportScope === 'range' ? 'border-orange-500 bg-orange-500/10 shadow-[0_0_14px_rgba(249,115,22,0.12)]' : 'border-slate-200 hover:border-orange-400 dark:border-slate-700'}`}>
+                <strong className="block text-xs font-black text-slate-900 dark:text-white">Custom Month Range</strong><span className="mt-1 block text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">Choose starting and ending months.</span>
+              </button>
+            </div>
+
+            {reportScope === 'range' && (
+              <div className="mb-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="text-xs font-bold text-slate-600 dark:text-slate-300">Starting month
+                  <input type="month" value={reportStartMonth} max={reportEndMonth || undefined} disabled={isReportGenerating} onChange={(event) => { setReportStartMonth(event.target.value); setGeneratedReport(null); setReportError(null); }} className="mt-1 block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-bold text-slate-800 outline-none focus:border-orange-500 dark:border-slate-700 dark:bg-[#070d1a] dark:text-white" />
+                </label>
+                <label className="text-xs font-bold text-slate-600 dark:text-slate-300">Ending month
+                  <input type="month" value={reportEndMonth} min={reportStartMonth || undefined} disabled={isReportGenerating} onChange={(event) => { setReportEndMonth(event.target.value); setGeneratedReport(null); setReportError(null); }} className="mt-1 block w-full rounded-xl border border-slate-300 bg-white px-3 py-2.5 text-sm font-bold text-slate-800 outline-none focus:border-orange-500 dark:border-slate-700 dark:bg-[#070d1a] dark:text-white" />
+                </label>
+              </div>
+            )}
+
+            <div className="space-y-2 rounded-2xl border border-orange-500/25 bg-orange-500/5 p-4 text-xs dark:bg-orange-500/10">
+              <div className="flex items-start justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Selected class</span><strong className="max-w-[65%] break-words text-right text-slate-900 dark:text-white">{currentClass.name} <span className="block text-[10px] font-semibold text-slate-500">ID: {selectedClassId || 'N/A'}</span></strong></div>
+              <div className="flex items-start justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Report scope</span><strong className="text-right text-slate-900 dark:text-white">{reportScope === 'selected' ? 'Selected month' : reportScope === 'history' ? 'All available monthly records' : 'Custom month range'}</strong></div>
+              <div className="flex items-start justify-between gap-4"><span className="text-slate-500 dark:text-slate-400">Report period</span><strong className="text-right text-slate-900 dark:text-white">{reportScope === 'selected' ? formatMonthLabel(selectedMonth) : reportScope === 'history' ? 'Determined from available class records' : `${formatMonthLabel(reportStartMonth)} – ${formatMonthLabel(reportEndMonth)}`}</strong></div>
+              <p className="border-t border-orange-500/15 pt-2 text-[10px] leading-relaxed text-slate-500 dark:text-slate-400">Includes eligible students and historical student IDs. Missing records remain marked as unavailable. Legacy paidAmount aggregates are not represented as detailed receipts. Receipt collections are assigned to a period only when their stored payment date is verifiable.</p>
+            </div>
+
+            {reportError && <div role="alert" className="mt-4 rounded-xl border border-rose-300 bg-rose-50 px-3.5 py-3 text-xs font-semibold text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300">{reportError}</div>}
+            {generatedReport && generatedReport.signature === currentReportSignature() && !isReportGenerating && (
+              <div className={`mt-4 rounded-xl border px-3.5 py-3 text-xs ${generatedReport.model.isComplete ? 'border-emerald-300 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300' : 'border-amber-300 bg-amber-50 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200'}`}>
+                <strong className="block">{generatedReport.model.isComplete ? 'Report generated' : 'Report generated with data limitations'}</strong>
+                <span className="mt-1 block break-words">{generatedReport.filename}</span>
+                <span className="mt-1 block">{generatedReport.model.months.length} month(s), {generatedReport.model.months.reduce((sum, month) => sum + month.rows.length, 0)} student ledger row(s), {generatedReport.model.transactions.length} receipt record(s).</span>
+                {generatedReport.model.warnings.length > 0 && <span className="mt-1 block">{generatedReport.model.warnings.slice(0, 2).join(' ')}{generatedReport.model.warnings.length > 2 ? ' Additional data-quality notes are included in the report.' : ''}</span>}
+              </div>
+            )}
+
+            <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button type="button" disabled={isReportGenerating} onClick={() => setIsReportModalOpen(false)} className="rounded-xl border border-slate-300 px-4 py-3 text-xs font-black text-slate-600 transition-colors hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800">Cancel</button>
+              <button type="button" disabled={isReportGenerating || !currentUserEmail || !selectedClassId} onClick={() => void handleReportAction('print')} className="inline-flex items-center justify-center gap-2 rounded-xl border border-orange-500/50 bg-white px-4 py-3 text-xs font-black text-orange-700 transition-all hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-[#070d1a] dark:text-orange-300 dark:hover:bg-orange-500/10">
+                {isReportGenerating ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Printer className="h-4 w-4" />}{isReportGenerating ? 'Generating…' : 'Print'}
+              </button>
+              <button type="button" disabled={isReportGenerating || !currentUserEmail || !selectedClassId} onClick={() => void handleReportAction('download')} className="inline-flex items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-orange-500 to-amber-500 px-4 py-3 text-xs font-black text-white shadow-[0_0_18px_rgba(249,115,22,0.3)] transition-all hover:from-orange-600 hover:to-amber-600 disabled:cursor-not-allowed disabled:opacity-50">
+                {isReportGenerating ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}{isReportGenerating ? 'Generating…' : 'Download PDF'}
+              </button>
             </div>
           </div>
         </div>
