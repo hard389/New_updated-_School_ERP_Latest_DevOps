@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 
 // Firebase Firestore & Auth Imports
-import { collection, getDocs, onSnapshot, doc, getDoc, query, where } from 'firebase/firestore';
+import { collection, documentId, onSnapshot, doc, getDoc, query, where } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth, db } from '../lib/firebase';
 
@@ -37,20 +37,178 @@ import { StudentCaptureSection } from '../components/analytics/StudentCaptureSec
 export type CaptureCriteria = 'Weighted Score' | 'Attendance Rate' | 'Quiz Marks' | 'overallScore' | 'manualTag';
 
 // Pure analytics/data-contract helpers. These functions never write to Firestore.
-const EMPTY_METRICS = {
-  attendanceRate: 0,
-  absentPercentage: 0,
-  presentCount: 0,
-  lateCount: 0,
-  absentCount: 0,
-  absentToday: 0,
-  feeRecoveryRate: 0,
-  paidCount: 0,
-  pendingCount: 0,
-  totalRevenue: 0,
-  dailyCollectedRevenue: 0,
-  dailyPaidCount: 0,
-  totalStudentsCount: 0,
+type LiveStatus = 'idle' | 'loading' | 'ready' | 'error';
+
+interface LiveCollectionSource {
+  status: LiveStatus;
+  hasSnapshot: boolean;
+  serverSynced: boolean;
+  docs: any[];
+  error: string | null;
+  scopeKey?: string;
+}
+
+interface LiveDocumentSource {
+  status: LiveStatus;
+  hasSnapshot: boolean;
+  serverSynced: boolean;
+  data: Record<string, any> | null;
+  exists: boolean;
+  validData: boolean;
+  error: string | null;
+  scopeKey?: string;
+}
+
+interface AnalyticsMetrics {
+  attendanceRate: number | null;
+  absentPercentage: number | null;
+  presentCount: number | null;
+  lateCount: number | null;
+  absentCount: number | null;
+  absentToday: number | null;
+  feeRecoveryRate: number | null;
+  paidCount: number | null;
+  pendingCount: number | null;
+  totalRevenue: number | null;
+  dailyCollectedRevenue: number | null;
+  dailyPaidCount: number | null;
+  totalStudentsCount: number | null;
+}
+
+const EMPTY_METRICS: AnalyticsMetrics = {
+  attendanceRate: null,
+  absentPercentage: null,
+  presentCount: null,
+  lateCount: null,
+  absentCount: null,
+  absentToday: null,
+  feeRecoveryRate: null,
+  paidCount: null,
+  pendingCount: null,
+  totalRevenue: null,
+  dailyCollectedRevenue: null,
+  dailyPaidCount: null,
+  totalStudentsCount: null,
+};
+
+const emptyCollectionSource = (status: LiveStatus = 'loading'): LiveCollectionSource => ({
+  status,
+  hasSnapshot: false,
+  serverSynced: false,
+  docs: [],
+  error: null,
+});
+
+const emptyDocumentSource = (status: LiveStatus = 'loading'): LiveDocumentSource => ({
+  status,
+  hasSnapshot: false,
+  serverSynced: false,
+  data: null,
+  exists: false,
+  validData: false,
+  error: null,
+});
+
+const describeFirestoreError = (section: string, error: any): string => {
+  const code = typeof error?.code === 'string' && error.code.trim() ? `${error.code}: ` : '';
+  const detail = typeof error?.message === 'string' && error.message.trim()
+    ? error.message.trim()
+    : 'Unknown Firestore error';
+  return `${section} — ${code}${detail}`;
+};
+
+// Existing legacy IDs are class-prefixed. Probe only deterministic IDs for dates in the
+// selected report window; modern class-tagged records are covered by a class-only query.
+const legacyAttendanceIdsForDates = (classId: string, dateKeys: string[]): string[] => {
+  const ids = new Set<string>();
+  dateKeys.forEach((key) => {
+    const match = key.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (!match) return;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    ids.add(`${classId}_${key}`);
+    // These separators/padding variants are parseable by the existing legacy date normalizer.
+    ids.add(`${classId}_${month}-${day}-${year}`);
+    ids.add(`${classId}_${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}-${year}`);
+  });
+  return [...ids];
+};
+
+const dateKeysForMonth = (monthKey: string): string[] => {
+  const match = monthKey.match(/^(\d{4})-(\d{2})$/);
+  if (!match) return [];
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  if (month < 1 || month > 12) return [];
+  const totalDays = new Date(year, month, 0).getDate();
+  return Array.from({ length: totalDays }, (_, index) =>
+    `${year}-${String(month).padStart(2, '0')}-${String(index + 1).padStart(2, '0')}`
+  );
+};
+
+interface PaymentReceiptSummary {
+  totalsByStudent: Record<string, number>;
+  lastDateByStudent: Record<string, string>;
+  exactDayRevenue: number;
+  studentsPaidExactDay: Set<string>;
+  warnings: string[];
+}
+
+const emptyPaymentReceiptSummary = (): PaymentReceiptSummary => ({
+  totalsByStudent: {},
+  lastDateByStudent: {},
+  exactDayRevenue: 0,
+  studentsPaidExactDay: new Set<string>(),
+  warnings: [],
+});
+
+const summarizePaymentReceipts = (
+  sourceDocs: any[],
+  selectedClassId: string,
+  expectedMonthKey: string,
+  selectedDateKey: string,
+  rosterIds: Set<string>,
+): PaymentReceiptSummary => {
+  const totalsByStudent: Record<string, number> = {};
+  const lastDateByStudent: Record<string, string> = {};
+  let exactDayRevenue = 0;
+  const studentsPaidExactDay = new Set<string>();
+  const seenPaymentIds = new Set<string>();
+  const warnings: string[] = [];
+
+  sourceDocs.forEach((receiptSnap: any) => {
+    const receipt = receiptSnap.data() || {};
+    const receiptId = String(receipt.paymentId ?? receiptSnap.id);
+    if (seenPaymentIds.has(receiptId)) return;
+    seenPaymentIds.add(receiptId);
+    if (receipt.classId !== undefined && String(receipt.classId) !== selectedClassId) return;
+    if (receipt.month !== undefined && normalizeMonthKey(receipt.month) !== expectedMonthKey) return;
+    const studentIdRaw = receipt.studentId;
+    if (studentIdRaw === undefined || studentIdRaw === null || String(studentIdRaw).trim() === '') {
+      warnings.push(`Payment receipt ${receiptSnap.id} has no stable studentId and was excluded.`);
+      return;
+    }
+    const studentId = String(studentIdRaw);
+    if (!rosterIds.has(studentId)) return;
+    const amount = parseNonNegativeNumber(receipt.amount);
+    const paymentDate = normalizeDate(receipt.createdAt) || normalizeDate(receipt.paidAt) || normalizeDate(receipt.date);
+    if (amount === null || amount <= 0) {
+      warnings.push(`Payment receipt ${receiptSnap.id} has an invalid/non-positive amount and was excluded.`);
+      console.warn(`[Analytics] Ignored malformed payment receipt ${receiptSnap.id}.`);
+      return;
+    }
+    totalsByStudent[studentId] = (totalsByStudent[studentId] ?? 0) + amount;
+    if (paymentDate && (!lastDateByStudent[studentId] || paymentDate > lastDateByStudent[studentId])) {
+      lastDateByStudent[studentId] = paymentDate;
+    }
+    if (paymentDate === selectedDateKey) {
+      exactDayRevenue += amount;
+      studentsPaidExactDay.add(studentId);
+    }
+  });
+
+  return { totalsByStudent, lastDateByStudent, exactDayRevenue, studentsPaidExactDay, warnings };
 };
 
 const isPlainObject = (value: any): value is Record<string, any> => {
@@ -895,9 +1053,20 @@ function BottomNavbar() {
 // ==========================================
 export default function AnalyticsPage() {
   const navigate = useNavigate();
-  const [isDark, setIsDark] = useState(true);
+  const [isDark, setIsDark] = useState(false);
   const [loading, setLoading] = useState(true);
   const [fetchingMetrics, setFetchingMetrics] = useState(false);
+  const [retryNonce, setRetryNonce] = useState(0);
+  const [classesSource, setClassesSource] = useState({
+    status: 'loading' as LiveStatus, hasSnapshot: false, serverSynced: false, error: null as string | null, scopeKey: undefined as string | undefined,
+  });
+  const [attendanceSource, setAttendanceSource] = useState<LiveCollectionSource>(emptyCollectionSource());
+  const [legacyAttendanceSource, setLegacyAttendanceSource] = useState<LiveCollectionSource>(emptyCollectionSource());
+  const [dailyLegacyAttendanceSource, setDailyLegacyAttendanceSource] = useState<LiveCollectionSource>(emptyCollectionSource('idle'));
+  const [quizSource, setQuizSource] = useState<LiveCollectionSource>(emptyCollectionSource());
+  const [feeSource, setFeeSource] = useState<LiveDocumentSource>(emptyDocumentSource());
+  const [monthlyPaymentsSource, setMonthlyPaymentsSource] = useState<LiveCollectionSource>(emptyCollectionSource());
+  const [dailyPaymentsSource, setDailyPaymentsSource] = useState<LiveCollectionSource>(emptyCollectionSource('idle'));
 
   // Authenticated User Email State
   const [userEmail, setUserEmail] = useState<string | null>(null);
@@ -926,8 +1095,15 @@ export default function AnalyticsPage() {
       setCaptureMetricSnapshot(null);
       setMetrics({ ...EMPTY_METRICS });
       setTrendDataPoints([0, 0, 0, 0, 0, 0, 0]);
-      setFetchingMetrics(false);
       setNoDataNotification(null);
+      setClassesSource({ status: 'loading', hasSnapshot: false, serverSynced: false, error: null, scopeKey: undefined });
+      setAttendanceSource(emptyCollectionSource());
+      setLegacyAttendanceSource(emptyCollectionSource());
+      setDailyLegacyAttendanceSource(emptyCollectionSource('idle'));
+      setQuizSource(emptyCollectionSource());
+      setFeeSource(emptyDocumentSource());
+      setMonthlyPaymentsSource(emptyCollectionSource());
+      setDailyPaymentsSource(emptyCollectionSource('idle'));
     };
 
     const unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
@@ -998,7 +1174,7 @@ export default function AnalyticsPage() {
       authGeneration++;
       unsubscribeAuth();
     };
-  }, []);
+  }, [retryNonce]);
 
   // Dynamic Class Creation Date Based Months
   const currentClass = useMemo(() => {
@@ -1064,27 +1240,32 @@ export default function AnalyticsPage() {
     }, 2500);
   };
 
-  // 1. Listen only to this verified teacher's class subcollection. Never fall back to root classes.
+  // 1. Listen only to this verified teacher's class subcollection. Cache snapshots are
+  // usable as provisional data, but only a non-cache snapshot marks the source server-synced.
   useEffect(() => {
     let cancelled = false;
 
     if (!userEmail) {
       setClassesList([]);
       setSelectedClassId('');
-      // Auth/tenant resolution owns the loading state until the identity check completes.
+      setClassesSource({ status: 'loading', hasSnapshot: false, serverSynced: false, error: null, scopeKey: undefined });
       return;
     }
 
     setLoading(true);
     setClassesList([]);
     setSelectedClassId('');
+    setClassesSource({ status: 'loading', hasSnapshot: false, serverSynced: false, error: null, scopeKey: userEmail });
     setCaptureMetricSnapshot(null);
+    setMetrics({ ...EMPTY_METRICS });
 
     const classesRef = collection(db, 'users', userEmail, 'classes');
     const unsubscribe = onSnapshot(
       classesRef,
+      { includeMetadataChanges: true },
       (snapshot) => {
         if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
         const loadedClasses = snapshot.docs.map((docSnap) => {
           const data = docSnap.data() || {};
           const fee = parseNonNegativeNumber(data.monthlyFee ?? data.fee ?? data.classFee);
@@ -1101,8 +1282,14 @@ export default function AnalyticsPage() {
         loadedClasses.sort((a, b) =>
           a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
         );
+        setClassesSource({
+          status: serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          error: null,
+          scopeKey: userEmail,
+        });
         setClassesList(loadedClasses);
-        setNoDataNotification(null);
         setSelectedClassId((previous) =>
           previous && loadedClasses.some((item) => item.id === previous)
             ? previous
@@ -1112,18 +1299,10 @@ export default function AnalyticsPage() {
       },
       (error: any) => {
         if (cancelled) return;
-        console.error(`[Analytics] Class listener failed for users/${userEmail}/classes:`, error);
-        setClassesList([]);
-        setSelectedClassId('');
-        setFeeDetailedStudents([]);
-        setCaptureMetricSnapshot(null);
-        setMetrics({ ...EMPTY_METRICS });
-        setTrendDataPoints([0, 0, 0, 0, 0, 0, 0]);
-        setNoDataNotification(error?.code === 'permission-denied'
-          ? 'Access denied while loading classes. Check Firestore Security Rules.'
-          : error?.code === 'unavailable' || error?.code === 'deadline-exceeded'
-          ? 'Network problem while loading classes. Please check your connection.'
-          : 'Could not load classes. Please try again.');
+        const message = describeFirestoreError(`Classes (users/${userEmail}/classes)`, error);
+        console.error('[Analytics] Class listener failed:', error?.code, error?.message, error);
+        setClassesSource((previous) => ({ ...previous, status: 'error', error: message }));
+        setNoDataNotification(message);
         setLoading(false);
       }
     );
@@ -1132,7 +1311,7 @@ export default function AnalyticsPage() {
       cancelled = true;
       unsubscribe();
     };
-  }, [userEmail]);
+  }, [userEmail, retryNonce]);
 
   // Ensure selectedClassId stays valid
   useEffect(() => {
@@ -1144,310 +1323,596 @@ export default function AnalyticsPage() {
     }
   }, [classesList, selectedClassId]);
 
-  // 2. Tenant- and class-scoped analytics. This effect is read-only and cancels stale async results.
+  const normalizedSelectedDate = normalizeDate(selectedDate);
+  const selectedDateMonth = normalizedSelectedDate ? normalizedSelectedDate.slice(0, 7) : '';
+  const needsCrossMonthDailySources = analyticsType === 'daily' && Boolean(selectedDateMonth) && selectedDateMonth !== selectedMonthKey;
+  const baseScopeKey = `${userEmail ?? ''}::${selectedClassId}::${selectedMonthKey}`;
+  const dailySourceScopeKey = `${baseScopeKey}::${normalizedSelectedDate}::${selectedDateMonth}`;
+
+  // 2. Live subscriptions for the current teacher, class, and Record Month.
+  // All paths remain under users/{authenticatedTeacherEmail}; no global fallback is used.
   useEffect(() => {
     let cancelled = false;
-    const selectedClassForContext = classesList.find((item) => item.id === selectedClassId);
-    const captureContextKey = buildCaptureContextKey(userEmail, selectedClassId, selectedMonthKey, selectedClassForContext);
+    const unsubscribers: Array<() => void> = [];
+    const contextIsValid = Boolean(userEmail && selectedClassId && selectedMonthKey);
 
-    // Remove stale values immediately whenever the tenant, class, month or report mode changes.
-    setFetchingMetrics(Boolean(userEmail && selectedClassId && selectedMonthKey));
+    setAttendanceSource({ ...emptyCollectionSource(), scopeKey: baseScopeKey });
+    setLegacyAttendanceSource({ ...emptyCollectionSource(), scopeKey: baseScopeKey });
+    setQuizSource({ ...emptyCollectionSource(), scopeKey: baseScopeKey });
+    setFeeSource({ ...emptyDocumentSource(), scopeKey: baseScopeKey });
+    setMonthlyPaymentsSource({ ...emptyCollectionSource(), scopeKey: baseScopeKey });
     setFeeDetailedStudents([]);
     setCaptureMetricSnapshot(null);
     setMetrics({ ...EMPTY_METRICS });
     setTrendDataPoints([0, 0, 0, 0, 0, 0, 0]);
 
-    if (!userEmail || !selectedClassId || !selectedMonthKey) {
-      setFetchingMetrics(false);
+    if (!contextIsValid || !userEmail || !selectedClassId || !selectedMonthKey) {
       return () => { cancelled = true; };
     }
-    setNoDataNotification(null);
 
-    const calculateAnalytics = async () => {
-      const warnings: string[] = [];
-      try {
-        const activeClass = classesList.find((item) => item.id === selectedClassId);
-        if (!activeClass) {
-          if (!cancelled) {
-            setFeeDetailedStudents([]);
-            setMetrics({ ...EMPTY_METRICS });
-            setNoDataNotification('The selected class is no longer available in this teacher workspace.');
+    const attendanceCollection = collection(db, 'users', userEmail, 'attendance');
+    const classAttendanceQuery = query(attendanceCollection, where('classId', '==', selectedClassId));
+    const unsubscribeAttendance = onSnapshot(
+      classAttendanceQuery,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
+        setAttendanceSource({
+          status: serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          docs: snapshot.docs,
+          error: null,
+          scopeKey: baseScopeKey,
+        });
+      },
+      (error: any) => {
+        if (cancelled) return;
+        const message = describeFirestoreError(`Attendance for class ${selectedClassId}`, error);
+        console.error('[Analytics] Attendance listener failed:', error?.code, error?.message, error);
+        setAttendanceSource((previous) => ({ ...previous, status: 'error', error: message }));
+      }
+    );
+    unsubscribers.push(unsubscribeAttendance);
+
+    // Legacy records are not guaranteed to have classId/date fields. Probe only document IDs
+    // supported by the existing class-prefixed date normalizer for dates in this report month.
+    const legacyIds = legacyAttendanceIdsForDates(selectedClassId, dateKeysForMonth(selectedMonthKey));
+    const legacyChunks: string[][] = [];
+    for (let i = 0; i < legacyIds.length; i += 25) legacyChunks.push(legacyIds.slice(i, i + 25));
+    if (legacyChunks.length === 0) {
+      setLegacyAttendanceSource({ ...emptyCollectionSource('ready'), hasSnapshot: true, serverSynced: true, scopeKey: baseScopeKey });
+    } else {
+      const batchDocs = new Map<number, Map<string, any>>();
+      const batchCacheState = new Map<number, boolean>();
+      const seenBatches = new Set<number>();
+      const batchErrors = new Map<number, string>();
+      const publishLegacyState = () => {
+        const docsById = new Map<string, any>();
+        batchDocs.forEach((docs) => docs.forEach((value, id) => docsById.set(id, value)));
+        const allSeen = seenBatches.size === legacyChunks.length;
+        const error = [...batchErrors.values()][0] ?? null;
+        const allServerSynced = allSeen && !error && legacyChunks.every((_chunk, index) => batchCacheState.get(index) === false);
+        setLegacyAttendanceSource({
+          status: error ? 'error' : allServerSynced ? 'ready' : 'loading',
+          hasSnapshot: allSeen,
+          serverSynced: allServerSynced,
+          docs: [...docsById.values()],
+          error,
+          scopeKey: baseScopeKey,
+        });
+      };
+      legacyChunks.forEach((chunk, index) => {
+        const legacyQuery = query(attendanceCollection, where(documentId(), 'in', chunk));
+        const unsubscribe = onSnapshot(
+          legacyQuery,
+          { includeMetadataChanges: true },
+          (snapshot) => {
+            if (cancelled) return;
+            const docs = new Map<string, any>();
+            snapshot.docs.forEach((docSnap) => docs.set(docSnap.id, docSnap));
+            batchDocs.set(index, docs);
+            batchCacheState.set(index, snapshot.metadata.fromCache);
+            seenBatches.add(index);
+            batchErrors.delete(index);
+            publishLegacyState();
+          },
+          (error: any) => {
+            if (cancelled) return;
+            const message = describeFirestoreError(`Legacy attendance compatibility query ${index + 1}`, error);
+            console.error('[Analytics] Legacy attendance query failed:', error?.code, error?.message, error);
+            batchErrors.set(index, message);
+            publishLegacyState();
           }
+        );
+        unsubscribers.push(unsubscribe);
+      });
+    }
+
+    const quizCollection = collection(db, 'users', userEmail, 'classes', selectedClassId, 'quizzes');
+    unsubscribers.push(onSnapshot(
+      quizCollection,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
+        setQuizSource({
+          status: serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          docs: snapshot.docs,
+          error: null,
+          scopeKey: baseScopeKey,
+        });
+      },
+      (error: any) => {
+        if (cancelled) return;
+        const message = describeFirestoreError(`Quizzes for class ${selectedClassId}`, error);
+        console.error('[Analytics] Quiz listener failed:', error?.code, error?.message, error);
+        setQuizSource((previous) => ({ ...previous, status: 'error', error: message }));
+      }
+    ));
+
+    const targetFeeDocId = `${selectedClassId}_${selectedMonthKey}`;
+    const feeDocRef = doc(db, 'users', userEmail, 'fees', targetFeeDocId);
+    unsubscribers.push(onSnapshot(
+      feeDocRef,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
+        const data = snapshot.exists() ? (snapshot.data() || {}) : null;
+        let validationError: string | null = null;
+        if (data && data.classId !== undefined && String(data.classId) !== selectedClassId) {
+          validationError = `Fee document ${targetFeeDocId} has classId ${String(data.classId)}, which does not match its path.`;
+        } else if (data && data.month !== undefined && normalizeMonthKey(data.month) !== selectedMonthKey) {
+          validationError = `Fee document ${targetFeeDocId} has month ${String(data.month)}, which does not match ${selectedMonthKey}.`;
+        }
+        const identityValid = !validationError;
+        const message = validationError ? `Fee data — ${validationError} Analytics excluded this document.` : null;
+        if (message) console.error('[Analytics] Invalid fee document:', message);
+        setFeeSource({
+          status: message ? 'error' : serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          data: identityValid ? data : null,
+          exists: identityValid && snapshot.exists(),
+          validData: identityValid,
+          error: message,
+          scopeKey: baseScopeKey,
+        });
+      },
+      (error: any) => {
+        if (cancelled) return;
+        const message = describeFirestoreError(`Fee document ${targetFeeDocId}`, error);
+        console.error('[Analytics] Fee document listener failed:', error?.code, error?.message, error);
+        setFeeSource((previous) => ({ ...previous, status: 'error', error: message }));
+      }
+    ));
+
+    const paymentCollection = collection(db, 'users', userEmail, 'fees', targetFeeDocId, 'payments');
+    unsubscribers.push(onSnapshot(
+      paymentCollection,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
+        setMonthlyPaymentsSource({
+          status: serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          docs: snapshot.docs,
+          error: null,
+          scopeKey: baseScopeKey,
+        });
+      },
+      (error: any) => {
+        if (cancelled) return;
+        const message = describeFirestoreError(`Payment receipts for ${targetFeeDocId}`, error);
+        console.error('[Analytics] Monthly payment listener failed:', error?.code, error?.message, error);
+        setMonthlyPaymentsSource((previous) => ({ ...previous, status: 'error', error: message }));
+      }
+    ));
+
+    return () => {
+      cancelled = true;
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [userEmail, selectedClassId, selectedMonthKey, baseScopeKey, retryNonce]);
+
+  // 3. Subscribe only to legacy attendance IDs for a selected day outside Record Month, and
+  // receipts beneath that day's actual fee-month document. The base month listeners are retained.
+  useEffect(() => {
+    let cancelled = false;
+    const unsubscribers: Array<() => void> = [];
+    setDailyLegacyAttendanceSource({ ...emptyCollectionSource(needsCrossMonthDailySources ? 'loading' : 'idle'), scopeKey: needsCrossMonthDailySources ? dailySourceScopeKey : undefined });
+    setDailyPaymentsSource({ ...emptyCollectionSource(needsCrossMonthDailySources ? 'loading' : 'idle'), scopeKey: needsCrossMonthDailySources ? dailySourceScopeKey : undefined });
+
+    if (!userEmail || !selectedClassId || !selectedMonthKey || !needsCrossMonthDailySources || !selectedDateMonth) {
+      return () => { cancelled = true; };
+    }
+
+    const attendanceCollection = collection(db, 'users', userEmail, 'attendance');
+    const dayLegacyIds = legacyAttendanceIdsForDates(selectedClassId, [normalizedSelectedDate]);
+    const batches: string[][] = [];
+    for (let i = 0; i < dayLegacyIds.length; i += 25) batches.push(dayLegacyIds.slice(i, i + 25));
+    if (batches.length === 0) {
+      setDailyLegacyAttendanceSource({ ...emptyCollectionSource('ready'), hasSnapshot: true, serverSynced: true, scopeKey: dailySourceScopeKey });
+    } else {
+      const batchDocs = new Map<number, Map<string, any>>();
+      const batchCacheState = new Map<number, boolean>();
+      const seenBatches = new Set<number>();
+      const batchErrors = new Map<number, string>();
+      const publish = () => {
+        const docsById = new Map<string, any>();
+        batchDocs.forEach((docs) => docs.forEach((value, id) => docsById.set(id, value)));
+        const allSeen = seenBatches.size === batches.length;
+        const error = [...batchErrors.values()][0] ?? null;
+        const serverSynced = allSeen && !error && batches.every((_chunk, index) => batchCacheState.get(index) === false);
+        setDailyLegacyAttendanceSource({
+          status: error ? 'error' : serverSynced ? 'ready' : 'loading',
+          hasSnapshot: allSeen,
+          serverSynced,
+          docs: [...docsById.values()],
+          error,
+          scopeKey: dailySourceScopeKey,
+        });
+      };
+      batches.forEach((chunk, index) => {
+        unsubscribers.push(onSnapshot(
+          query(attendanceCollection, where(documentId(), 'in', chunk)),
+          { includeMetadataChanges: true },
+          (snapshot) => {
+            if (cancelled) return;
+            const docs = new Map<string, any>();
+            snapshot.docs.forEach((docSnap) => docs.set(docSnap.id, docSnap));
+            batchDocs.set(index, docs);
+            batchCacheState.set(index, snapshot.metadata.fromCache);
+            seenBatches.add(index);
+            batchErrors.delete(index);
+            publish();
+          },
+          (error: any) => {
+            if (cancelled) return;
+            const message = describeFirestoreError(`Legacy attendance for ${normalizedSelectedDate}`, error);
+            console.error('[Analytics] Daily legacy attendance query failed:', error?.code, error?.message, error);
+            batchErrors.set(index, message);
+            publish();
+          }
+        ));
+      });
+    }
+
+    const targetDailyFeeDocId = `${selectedClassId}_${selectedDateMonth}`;
+    const dailyPaymentCollection = collection(db, 'users', userEmail, 'fees', targetDailyFeeDocId, 'payments');
+    unsubscribers.push(onSnapshot(
+      dailyPaymentCollection,
+      { includeMetadataChanges: true },
+      (snapshot) => {
+        if (cancelled) return;
+        const serverSynced = !snapshot.metadata.fromCache;
+        setDailyPaymentsSource({
+          status: serverSynced ? 'ready' : 'loading',
+          hasSnapshot: true,
+          serverSynced,
+          docs: snapshot.docs,
+          error: null,
+          scopeKey: dailySourceScopeKey,
+        });
+      },
+      (error: any) => {
+        if (cancelled) return;
+        const message = describeFirestoreError(`Daily payment receipts for ${targetDailyFeeDocId}`, error);
+        console.error('[Analytics] Cross-month daily payment listener failed:', error?.code, error?.message, error);
+        setDailyPaymentsSource((previous) => ({ ...previous, status: 'error', error: message }));
+      }
+    ));
+
+    return () => {
+      cancelled = true;
+      unsubscribers.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [userEmail, selectedClassId, selectedMonthKey, normalizedSelectedDate, selectedDateMonth, needsCrossMonthDailySources, dailySourceScopeKey, retryNonce]);
+
+  const sourceErrorNotification = useMemo(() => {
+    const messages = [
+      classesSource.scopeKey === userEmail ? classesSource.error : null,
+      attendanceSource.scopeKey === baseScopeKey ? attendanceSource.error : null,
+      legacyAttendanceSource.scopeKey === baseScopeKey ? legacyAttendanceSource.error : null,
+      quizSource.scopeKey === baseScopeKey ? quizSource.error : null,
+      feeSource.scopeKey === baseScopeKey ? feeSource.error : null,
+      monthlyPaymentsSource.scopeKey === baseScopeKey ? monthlyPaymentsSource.error : null,
+      ...(needsCrossMonthDailySources ? [
+        dailyLegacyAttendanceSource.scopeKey === dailySourceScopeKey ? dailyLegacyAttendanceSource.error : null,
+        dailyPaymentsSource.scopeKey === dailySourceScopeKey ? dailyPaymentsSource.error : null,
+      ] : []),
+    ].filter((message): message is string => Boolean(message));
+    return messages[0] ?? null;
+  }, [
+    classesSource.error, classesSource.scopeKey, userEmail, baseScopeKey,
+    attendanceSource.error, attendanceSource.scopeKey, legacyAttendanceSource.error, legacyAttendanceSource.scopeKey,
+    quizSource.error, quizSource.scopeKey, feeSource.error, feeSource.scopeKey,
+    monthlyPaymentsSource.error, monthlyPaymentsSource.scopeKey, needsCrossMonthDailySources,
+    dailyLegacyAttendanceSource.error, dailyLegacyAttendanceSource.scopeKey,
+    dailyPaymentsSource.error, dailyPaymentsSource.scopeKey, dailySourceScopeKey,
+  ]);
+
+  const canRetrySync = Boolean(sourceErrorNotification || (noDataNotification && !noDataNotification.startsWith('No recorded attendance or payment receipts found')));
+
+  const isLiveConnected = Boolean(
+    userEmail && selectedClassId && selectedMonthKey &&
+    classesSource.scopeKey === userEmail && classesSource.status === 'ready' && classesSource.serverSynced &&
+    attendanceSource.scopeKey === baseScopeKey && attendanceSource.status === 'ready' && attendanceSource.serverSynced &&
+    legacyAttendanceSource.scopeKey === baseScopeKey && legacyAttendanceSource.status === 'ready' && legacyAttendanceSource.serverSynced &&
+    quizSource.scopeKey === baseScopeKey && quizSource.status === 'ready' && quizSource.serverSynced &&
+    feeSource.scopeKey === baseScopeKey && feeSource.status === 'ready' && feeSource.serverSynced && feeSource.validData &&
+    monthlyPaymentsSource.scopeKey === baseScopeKey && monthlyPaymentsSource.status === 'ready' && monthlyPaymentsSource.serverSynced &&
+    (!needsCrossMonthDailySources || (
+      dailyLegacyAttendanceSource.scopeKey === dailySourceScopeKey && dailyLegacyAttendanceSource.status === 'ready' && dailyLegacyAttendanceSource.serverSynced &&
+      dailyPaymentsSource.scopeKey === dailySourceScopeKey && dailyPaymentsSource.status === 'ready' && dailyPaymentsSource.serverSynced
+    ))
+  );
+
+  useEffect(() => {
+    setFetchingMetrics(Boolean(userEmail && selectedClassId && selectedMonthKey && !isLiveConnected));
+  }, [userEmail, selectedClassId, selectedMonthKey, isLiveConnected]);
+
+  // 4. Recompute locally from the latest listener snapshots. No source update triggers another read.
+  // Each category has its own availability gate, so a failing quiz listener cannot erase attendance.
+  const analyticsContextKey = `${userEmail ?? ''}::${selectedClassId}::${selectedMonthKey}::${analyticsType}::${analyticsType === 'daily' ? normalizedSelectedDate : ''}`;
+  const [metricsContextKey, setMetricsContextKey] = useState('');
+
+  // These memoized transforms are isolated by source/context. A fee receipt update won't
+  // repeatedly process the complete class attendance history or quiz score set.
+  const activeClass = useMemo(() => (
+    classesSource.scopeKey === userEmail && classesSource.hasSnapshot
+      ? classesList.find((item) => item.id === selectedClassId) || null
+      : null
+  ), [classesSource.scopeKey, classesSource.hasSnapshot, userEmail, classesList, selectedClassId]);
+  const uniqueStudents = useMemo(() => {
+    const byId = new Map<string, any>();
+    (Array.isArray(activeClass?.students) ? activeClass.students : []).forEach((student: any) => {
+      const rawId = student?.id ?? student?.studentId;
+      if (rawId === undefined || rawId === null || String(rawId).trim() === '') return;
+      const id = String(rawId);
+      if (!byId.has(id)) byId.set(id, { ...student, id });
+    });
+    return [...byId.values()];
+  }, [activeClass]);
+  const rosterIds = useMemo(() => new Set<string>(uniqueStudents.map((student) => String(student.id))), [uniqueStudents]);
+  const totalStudents = uniqueStudents.length;
+
+  const currentAttendanceSource = useMemo(
+    () => attendanceSource.scopeKey === baseScopeKey ? attendanceSource : emptyCollectionSource('idle'),
+    [attendanceSource, baseScopeKey]
+  );
+  const currentLegacyAttendanceSource = useMemo(
+    () => legacyAttendanceSource.scopeKey === baseScopeKey ? legacyAttendanceSource : emptyCollectionSource('idle'),
+    [legacyAttendanceSource, baseScopeKey]
+  );
+  const currentDailyLegacyAttendanceSource = useMemo(
+    () => dailyLegacyAttendanceSource.scopeKey === dailySourceScopeKey ? dailyLegacyAttendanceSource : emptyCollectionSource('idle'),
+    [dailyLegacyAttendanceSource, dailySourceScopeKey]
+  );
+  const currentQuizSource = useMemo(
+    () => quizSource.scopeKey === baseScopeKey ? quizSource : emptyCollectionSource('idle'),
+    [quizSource, baseScopeKey]
+  );
+  const currentFeeSource = useMemo(
+    () => feeSource.scopeKey === baseScopeKey ? feeSource : emptyDocumentSource('idle'),
+    [feeSource, baseScopeKey]
+  );
+  const currentMonthlyPaymentsSource = useMemo(
+    () => monthlyPaymentsSource.scopeKey === baseScopeKey ? monthlyPaymentsSource : emptyCollectionSource('idle'),
+    [monthlyPaymentsSource, baseScopeKey]
+  );
+  const currentDailyPaymentsSource = useMemo(
+    () => dailyPaymentsSource.scopeKey === dailySourceScopeKey ? dailyPaymentsSource : emptyCollectionSource('idle'),
+    [dailyPaymentsSource, dailySourceScopeKey]
+  );
+
+  const attendanceAnalysis = useMemo(() => {
+    const complete = currentAttendanceSource.hasSnapshot && currentLegacyAttendanceSource.hasSnapshot &&
+      (!needsCrossMonthDailySources || currentDailyLegacyAttendanceSource.hasSnapshot);
+    const docsById = new Map<string, any>();
+    [...currentAttendanceSource.docs, ...currentLegacyAttendanceSource.docs,
+      ...(needsCrossMonthDailySources ? currentDailyLegacyAttendanceSource.docs : [])]
+      .forEach((docSnap: any) => docsById.set(docSnap.id, docSnap));
+    const rowsByDate = new Map<string, { id: string; date: string; monthKey: string; data: any }>();
+    const warnings: string[] = [];
+
+    if (complete) {
+      docsById.forEach((docSnap) => {
+        const data = docSnap.data() || {};
+        const rawClassId = data.classId;
+        if (rawClassId !== undefined && rawClassId !== null && String(rawClassId).trim() !== '') {
+          if (String(rawClassId) !== selectedClassId) return;
+        } else if (!docSnap.id.startsWith(`${selectedClassId}_`)) {
           return;
         }
-
-        const classStudents: any[] = Array.isArray(activeClass.students) ? activeClass.students : [];
-        const studentsById = new Map<string, any>();
-        classStudents.forEach((student) => {
-          const rawId = student?.id ?? student?.studentId;
-          if (rawId === undefined || rawId === null || String(rawId).trim() === '') return;
-          const id = String(rawId);
-          if (!studentsById.has(id)) studentsById.set(id, student);
-        });
-        const uniqueStudents = Array.from(studentsById.entries()).map(([id, student]) => ({ ...student, id }));
-        const rosterIds = new Set(uniqueStudents.map((student) => String(student.id)));
-        const totalStudents = uniqueStudents.length;
-        const normalizedSelectedDate = normalizeDate(selectedDate);
-
-        // A. Attendance. Current Attendance writes include classId and date. If this class has no
-        // classId-tagged documents, use a legacy compatibility read inside this tenant only, then
-        // require an exact classId or `${classId}_` document-ID prefix.
-        const attendanceCollection = collection(db, 'users', userEmail, 'attendance');
-        const [monthYear, monthNumber] = selectedMonthKey.split('-').map(Number);
-        const monthStart = `${selectedMonthKey}-01`;
-        const monthEnd = `${monthYear}-${String(monthNumber).padStart(2, '0')}-${String(new Date(monthYear, monthNumber, 0).getDate()).padStart(2, '0')}`;
-        const monthAttendanceQuery = query(
-          attendanceCollection,
-          where('classId', '==', selectedClassId),
-          where('date', '>=', monthStart),
-          where('date', '<=', monthEnd)
-        );
-        const monthAttendanceSnapshot = await getDocs(monthAttendanceQuery);
-        const attendanceDocsById = new Map<string, any>();
-        monthAttendanceSnapshot.docs.forEach((docSnap) => attendanceDocsById.set(docSnap.id, docSnap));
-
-        // Daily mode may point to a date outside the selected month. Fetch only that class/date.
-        if (analyticsType === 'daily' && normalizedSelectedDate &&
-            normalizedSelectedDate.slice(0, 7) !== selectedMonthKey) {
-          const dailyQuery = query(
-            attendanceCollection,
-            where('classId', '==', selectedClassId),
-            where('date', '==', normalizedSelectedDate)
-          );
-          const dailySnapshot = await getDocs(dailyQuery);
-          dailySnapshot.docs.forEach((docSnap) => attendanceDocsById.set(docSnap.id, docSnap));
+        const date = attendanceDateFromDocument(data, docSnap.id, selectedClassId);
+        const monthKey = date ? date.slice(0, 7) : normalizeMonthKey(data.month);
+        if (!monthKey) {
+          warnings.push(`Attendance record ${docSnap.id} has no valid date/month and was excluded.`);
+          console.warn(`[Analytics] Skipped attendance record with no valid date/month: ${docSnap.id}`);
+          return;
         }
-
-        // Compatibility path for older documents without classId/date fields. It is only used
-        // when no standard record was found for the current month, and remains tenant-scoped.
-        if (monthAttendanceSnapshot.empty) {
-          // Prefer a class-only history query before the tenant-wide legacy compatibility scan.
-          // This avoids scanning every class on the teacher account when the current month is empty.
-          const classHistorySnapshot = await getDocs(query(attendanceCollection, where('classId', '==', selectedClassId)));
-          classHistorySnapshot.docs.forEach((docSnap) => attendanceDocsById.set(docSnap.id, docSnap));
-
-          if (classHistorySnapshot.empty) {
-            const legacySnapshot = await getDocs(attendanceCollection);
-            legacySnapshot.docs.forEach((docSnap) => {
-              const data = docSnap.data() || {};
-              if (data.classId !== undefined && data.classId !== null && String(data.classId) !== '') {
-                if (String(data.classId) !== selectedClassId) return;
-              } else if (!docSnap.id.startsWith(`${selectedClassId}_`)) {
-                return;
-              }
-              const date = attendanceDateFromDocument(data, docSnap.id, selectedClassId);
-              const monthKey = date ? date.slice(0, 7) : normalizeMonthKey(data.month);
-              if (monthKey === selectedMonthKey || (analyticsType === 'daily' && date === normalizedSelectedDate)) {
-                attendanceDocsById.set(docSnap.id, docSnap);
-              }
-            });
-          }
+        const dedupeKey = date || `${monthKey}:${docSnap.id}`;
+        const existing = rowsByDate.get(dedupeKey);
+        // Preserve the established duplicate authority: latest updatedAt wins.
+        if (!existing || timestampRank(data.updatedAt) >= timestampRank(existing.data.updatedAt)) {
+          rowsByDate.set(dedupeKey, { id: docSnap.id, date, monthKey, data });
         }
-        const attendanceDocs = Array.from(attendanceDocsById.values());
+      });
+    }
 
-        const rowsByDate = new Map<string, { id: string; date: string; monthKey: string; data: any }>();
-        attendanceDocs.forEach((docSnap) => {
-          const data = docSnap.data() || {};
-          if (data.classId !== undefined && data.classId !== null && String(data.classId) !== '' && String(data.classId) !== selectedClassId) return;
-          if ((data.classId === undefined || data.classId === null || String(data.classId) === '') &&
-              !docSnap.id.startsWith(`${selectedClassId}_`)) return;
+    const allRows = [...rowsByDate.values()];
+    const monthlyRows = allRows.filter((row) => row.monthKey === selectedMonthKey);
+    const dailyRows = normalizedSelectedDate ? allRows.filter((row) => row.date === normalizedSelectedDate) : [];
+    const monthly = buildAttendanceSummary(monthlyRows, rosterIds);
+    const daily = buildAttendanceSummary(dailyRows, rosterIds);
+    const active = analyticsType === 'daily' ? daily : monthly;
+    const weekdaySums = [0, 0, 0, 0, 0, 0, 0];
+    const weekdayCounts = [0, 0, 0, 0, 0, 0, 0];
+    monthlyRows.forEach((row) => {
+      if (!row.date) return;
+      const day = new Date(`${row.date}T12:00:00`).getDay();
+      const index = (day + 6) % 7;
+      const summary = summarizeAttendanceDocument(row.data, rosterIds).counts;
+      if (summary.total <= 0) return;
+      weekdaySums[index] += ((summary.present + summary.late) / summary.total) * 100;
+      weekdayCounts[index] += 1;
+    });
+    const trend = weekdaySums.map((sum, index) => weekdayCounts[index] > 0 ? Math.round(sum / weekdayCounts[index]) : 0);
+    return {
+      complete,
+      monthlyRows,
+      monthly,
+      daily,
+      active,
+      hasRecordedStudents: active.counts.total > 0,
+      trend,
+      warnings,
+    };
+  }, [
+    currentAttendanceSource, currentLegacyAttendanceSource, currentDailyLegacyAttendanceSource,
+    needsCrossMonthDailySources, selectedClassId, selectedMonthKey, normalizedSelectedDate, analyticsType, rosterIds,
+  ]);
 
-          const date = attendanceDateFromDocument(data, docSnap.id, selectedClassId);
-          const monthKey = date ? date.slice(0, 7) : normalizeMonthKey(data.month);
-          if (!monthKey) {
-            console.warn(`[Analytics] Skipped attendance record with no valid date/month: ${docSnap.id}`);
+  const quizAnalysis = useMemo(() => {
+    const samplesByStudent: Record<string, Array<{ marksObtained: number; totalMarks: number }>> = {};
+    const warnings: string[] = [];
+    if (currentQuizSource.hasSnapshot) {
+      currentQuizSource.docs.forEach((quizSnap: any) => {
+        const quiz = quizSnap.data() || {};
+        const quizMonth = normalizeMonthKey(quiz.monthKey) || normalizeMonthKey(quiz.date) || normalizeMonthKey(quiz.createdAt);
+        if (quizMonth !== selectedMonthKey) return;
+        const totalMarks = parseNonNegativeNumber(quiz.totalMarks);
+        if (totalMarks === null || totalMarks <= 0 || !Array.isArray(quiz.studentScores)) {
+          warnings.push(`Quiz ${quizSnap.id} is malformed and was excluded.`);
+          console.warn(`[Analytics] Skipped malformed quiz record: ${quizSnap.id}`);
+          return;
+        }
+        const scoredInThisQuiz = new Set<string>();
+        quiz.studentScores.forEach((score: any) => {
+          if (!isPlainObject(score)) return;
+          const rawStudentId = score.id ?? score.studentId;
+          if (rawStudentId === undefined || rawStudentId === null || String(rawStudentId).trim() === '') return;
+          const studentId = String(rawStudentId);
+          if (!rosterIds.has(studentId) || scoredInThisQuiz.has(studentId)) return;
+          if (score.marksObtained === '' || score.marksObtained === null || score.marksObtained === undefined) return;
+          const marks = parseNonNegativeNumber(score.marksObtained);
+          if (marks === null || marks > totalMarks) {
+            warnings.push(`Invalid score for student ${studentId} in quiz ${quizSnap.id} was excluded.`);
+            console.warn(`[Analytics] Ignored invalid quiz mark for student ${studentId} in ${quizSnap.id}.`);
             return;
           }
-          const dedupeKey = date || `${monthKey}:${docSnap.id}`;
-          const existing = rowsByDate.get(dedupeKey);
-          if (!existing || timestampRank(data.updatedAt) >= timestampRank(existing.data.updatedAt)) {
-            rowsByDate.set(dedupeKey, { id: docSnap.id, date, monthKey, data });
-          }
+          scoredInThisQuiz.add(studentId);
+          (samplesByStudent[studentId] ??= []).push({ marksObtained: marks, totalMarks });
         });
-        const allAttendanceRows = Array.from(rowsByDate.values());
-        const monthlyAttendanceRows = allAttendanceRows.filter((row) => row.monthKey === selectedMonthKey);
-        const dailyAttendanceRows = normalizedSelectedDate
-          ? allAttendanceRows.filter((row) => row.date === normalizedSelectedDate)
-          : [];
-        const monthlyAttendance = buildAttendanceSummary(monthlyAttendanceRows, rosterIds);
-        const dailyAttendance = buildAttendanceSummary(dailyAttendanceRows, rosterIds);
-        const activeAttendance = analyticsType === 'daily' ? dailyAttendance : monthlyAttendance;
+      });
+    }
+    const totals: Record<string, { averagePercent: number }> = {};
+    Object.entries(samplesByStudent).forEach(([studentId, samples]) => {
+      const averagePercent = calculateAverageQuizPercent(samples);
+      if (averagePercent !== null) totals[studentId] = { averagePercent };
+    });
+    return { totals, warnings };
+  }, [currentQuizSource, selectedMonthKey, rosterIds]);
 
-        // A day contributes to the trend only when it has observed attendance. Missing weekdays
-        // stay at zero rather than receiving synthetic/default percentages.
-        const weekdayScoreSums = [0, 0, 0, 0, 0, 0, 0];
-        const weekdaySamples = [0, 0, 0, 0, 0, 0, 0];
-        monthlyAttendanceRows.forEach((row) => {
-          if (!row.date) return;
-          const day = new Date(`${row.date}T12:00:00`).getDay();
-          const weekdayIndex = (day + 6) % 7;
-          const rowSummary = summarizeAttendanceDocument(row.data, rosterIds).counts;
-          if (rowSummary.total <= 0) return;
-          weekdayScoreSums[weekdayIndex] += ((rowSummary.present + rowSummary.late) / rowSummary.total) * 100;
-          weekdaySamples[weekdayIndex] += 1;
-        });
-        const calculatedTrend = weekdayScoreSums.map((sum, index) =>
-          weekdaySamples[index] > 0 ? Math.round(sum / weekdaySamples[index]) : 0
-        );
+  const monthlyPaymentsAvailable = currentMonthlyPaymentsSource.hasSnapshot;
+  const monthlyReceiptSummary = useMemo(() => monthlyPaymentsAvailable
+    ? summarizePaymentReceipts(currentMonthlyPaymentsSource.docs, selectedClassId, selectedMonthKey, normalizedSelectedDate, rosterIds)
+    : emptyPaymentReceiptSummary(), [
+      monthlyPaymentsAvailable, currentMonthlyPaymentsSource, selectedClassId, selectedMonthKey, normalizedSelectedDate, rosterIds,
+    ]);
+  const dailyPaymentSourceForMetrics = selectedDateMonth === selectedMonthKey
+    ? currentMonthlyPaymentsSource
+    : currentDailyPaymentsSource;
+  const dailyPaymentsAvailable = analyticsType === 'daily' && Boolean(normalizedSelectedDate) && dailyPaymentSourceForMetrics.hasSnapshot &&
+    (selectedDateMonth === selectedMonthKey || needsCrossMonthDailySources);
+  const dailyReceiptSummary = useMemo(() => dailyPaymentsAvailable
+    ? summarizePaymentReceipts(dailyPaymentSourceForMetrics.docs, selectedClassId, selectedDateMonth, normalizedSelectedDate, rosterIds)
+    : emptyPaymentReceiptSummary(), [
+      dailyPaymentsAvailable, dailyPaymentSourceForMetrics, selectedClassId, selectedDateMonth, normalizedSelectedDate, rosterIds,
+    ]);
 
-        // B. Quiz marks. Quiz Management stores records in this class's subcollection, with
-        // monthKey values such as "October 2026" and marks in studentScores[].marksObtained.
-        const quizCollection = collection(db, 'users', userEmail, 'classes', selectedClassId, 'quizzes');
-        let quizSnapshotDocs: any[] = [];
-        try {
-          const quizSnapshot = await getDocs(quizCollection);
-          quizSnapshotDocs = quizSnapshot.docs;
-        } catch (error: any) {
-          warnings.push(error?.code === 'permission-denied'
-            ? 'Quiz data is unavailable because Firestore denied access.'
-            : 'Quiz data could not be loaded; quiz-based captures are unavailable.');
-          console.error(`[Analytics] Quiz read failed for ${selectedClassId}:`, error);
+  useEffect(() => {
+    let cancelled = false;
+    const captureContextKey = buildCaptureContextKey(userEmail, selectedClassId, selectedMonthKey, activeClass);
+
+    if (!userEmail || !selectedClassId || !selectedMonthKey || !activeClass) {
+      setMetrics({ ...EMPTY_METRICS });
+      setMetricsContextKey(analyticsContextKey);
+      setFeeDetailedStudents([]);
+      setCaptureMetricSnapshot(null);
+      setTrendDataPoints([0, 0, 0, 0, 0, 0, 0]);
+      if (userEmail && selectedClassId && classesSource.scopeKey === userEmail && classesSource.hasSnapshot && !activeClass) {
+        setNoDataNotification('The selected class is no longer available in this teacher workspace.');
+      }
+      return () => { cancelled = true; };
+    }
+
+    const attendanceCompleteEnoughToEvaluate = attendanceAnalysis.complete;
+    const monthlyAttendance = attendanceAnalysis.monthly;
+    const dailyAttendance = attendanceAnalysis.daily;
+    const activeAttendance = attendanceAnalysis.active;
+    const attendanceHasRecordedStudents = attendanceAnalysis.hasRecordedStudents;
+    const calculatedTrend = attendanceAnalysis.trend;
+    const attendanceWarnings = attendanceAnalysis.warnings;
+    const quizTotals = quizAnalysis.totals;
+    const quizWarnings = quizAnalysis.warnings;
+
+    // Fee map is nested in the monthly fee document; receipts are in its payments subcollection.
+    const feeData = currentFeeSource.data || {};
+    const rawFeeRecords = currentFeeSource.exists
+      ? (Object.prototype.hasOwnProperty.call(feeData, 'feeRecords') ? feeData.feeRecords : feeData)
+      : {};
+    const feeRecordsUsable = !currentFeeSource.exists || isPlainObject(rawFeeRecords);
+    const feeWarnings: string[] = [];
+    if (currentFeeSource.exists && !feeRecordsUsable) {
+      feeWarnings.push('The selected month feeRecords value is malformed; paid/pending student metrics were withheld.');
+      console.error(`[Analytics] Malformed feeRecords map in ${selectedClassId}_${selectedMonthKey}.`);
+    }
+
+    let paidStudentsCount = 0;
+    let monthTotalRevenue = 0;
+    const feeDetailList: FeeDetailStudent[] = [];
+    if (currentFeeSource.hasSnapshot && currentFeeSource.validData && feeRecordsUsable) {
+      uniqueStudents.forEach((student) => {
+        const studentId = String(student.id);
+        const recordRaw = rawFeeRecords[studentId];
+        const record = isPlainObject(recordRaw) ? recordRaw : null;
+        if (recordRaw !== undefined && record === null) {
+          feeWarnings.push(`Fee record for student ${studentId} is malformed and was excluded.`);
+          console.warn(`[Analytics] Ignored malformed fee record for student ${studentId}.`);
         }
-
-        const quizSamplesByStudent: Record<string, Array<{ marksObtained: number; totalMarks: number }>> = {};
-        quizSnapshotDocs.forEach((quizSnap) => {
-          const quiz = quizSnap.data() || {};
-          const quizMonth = normalizeMonthKey(quiz.monthKey) || normalizeMonthKey(quiz.date) || normalizeMonthKey(quiz.createdAt);
-          if (quizMonth !== selectedMonthKey) return;
-          const totalMarks = parseNonNegativeNumber(quiz.totalMarks);
-          if (totalMarks === null || totalMarks <= 0 || !Array.isArray(quiz.studentScores)) {
-            console.warn(`[Analytics] Skipped malformed quiz record: ${quizSnap.id}`);
-            return;
-          }
-
-          const scoredInThisQuiz = new Set<string>();
-          quiz.studentScores.forEach((score: any) => {
-            if (!isPlainObject(score)) return;
-            const rawStudentId = score.id ?? score.studentId;
-            if (rawStudentId === undefined || rawStudentId === null || String(rawStudentId).trim() === '') return;
-            const studentId = String(rawStudentId);
-            if (!rosterIds.has(studentId) || scoredInThisQuiz.has(studentId)) return;
-            // Empty/absent marks are missing, not zero. A literal 0 is a valid score.
-            if (score.marksObtained === '' || score.marksObtained === null || score.marksObtained === undefined) return;
-            const marks = parseNonNegativeNumber(score.marksObtained);
-            if (marks === null || marks > totalMarks) {
-              console.warn(`[Analytics] Ignored invalid quiz mark for student ${studentId} in ${quizSnap.id}.`);
-              return;
-            }
-            scoredInThisQuiz.add(studentId);
-            const samples = quizSamplesByStudent[studentId] ?? [];
-            samples.push({ marksObtained: marks, totalMarks });
-            quizSamplesByStudent[studentId] = samples;
-          });
-        });
-        const quizTotals: Record<string, { averagePercent: number }> = {};
-        Object.entries(quizSamplesByStudent).forEach(([studentId, samples]) => {
-          const averagePercent = calculateAverageQuizPercent(samples);
-          if (averagePercent !== null) quizTotals[studentId] = { averagePercent };
-        });
-
-        // C. Fees. The document ID is `${classId}_${YYYY-MM}`. Never read root/global fees.
-        const targetFeeDocId = `${selectedClassId}_${selectedMonthKey}`;
-        const feeDocRef = doc(db, 'users', userEmail, 'fees', targetFeeDocId);
-        const feeDocSnap = await getDoc(feeDocRef);
-        const feeData = feeDocSnap.exists() ? (feeDocSnap.data() || {}) : {};
-        if (feeDocSnap.exists()) {
-          if (feeData.classId !== undefined && String(feeData.classId) !== selectedClassId) {
-            throw new Error('Fee document classId does not match its path. Analytics was stopped to avoid mixing classes.');
-          }
-          if (feeData.month !== undefined && normalizeMonthKey(feeData.month) !== selectedMonthKey) {
-            throw new Error('Fee document month does not match its path. Analytics was stopped to avoid mixing months.');
-          }
-        }
-        let rawFeeRecords: Record<string, any> = {};
-        if (feeDocSnap.exists()) {
-          const raw = Object.prototype.hasOwnProperty.call(feeData, 'feeRecords') ? feeData.feeRecords : feeData;
-          if (!isPlainObject(raw)) {
-            warnings.push('Fee record map is malformed; fees were excluded rather than guessed.');
-            console.error(`[Analytics] Malformed feeRecords map in ${targetFeeDocId}.`);
-          } else {
-            rawFeeRecords = raw;
+        const recordPaidAmount = parseNonNegativeNumber(record?.paidAmount);
+        const receiptPaidAmount = monthlyReceiptSummary.totalsByStudent[studentId] ?? 0;
+        const amountPaid = Math.max(recordPaidAmount ?? 0, receiptPaidAmount);
+        const feeDue = parseNonNegativeNumber(record?.monthlyFeeDue)
+          ?? parseNonNegativeNumber(student.studentFee)
+          ?? parseNonNegativeNumber(activeClass.monthlyFee)
+          ?? 0;
+        const previousDues = parseNonNegativeNumber(record?.previousMonthDues) ?? 0;
+        const obligation = feeDue + previousDues;
+        const remainingDues = parseNonNegativeNumber(record?.remainingDues);
+        const status = String(record?.status ?? '').trim().toUpperCase();
+        let isFullyPaid = false;
+        if (obligation > 0) {
+          if (status === 'PAID') {
+            isFullyPaid = remainingDues === null || remainingDues <= 0.005;
+          } else if (!status && recordPaidAmount !== null) {
+            isFullyPaid = remainingDues !== null
+              ? remainingDues <= 0.005 && recordPaidAmount >= obligation - 0.005
+              : recordPaidAmount >= obligation - 0.005;
           }
         }
-
-        // Payment receipts are the only reliable source for daily cash collection. The fee
-        // record's updatedAt is a document edit time, not necessarily a payment date.
-        const receiptTotalsByStudent: Record<string, number> = {};
-        const dailyReceiptsByStudent: Record<string, number> = {};
-        const lastReceiptDateByStudent: Record<string, string> = {};
-        let dailyRevenue = 0;
-        const studentsPaidOnSelectedDate = new Set<string>();
-        const seenReceiptIds = new Set<string>();
-        try {
-          const paymentCollection = collection(db, 'users', userEmail, 'fees', targetFeeDocId, 'payments');
-          const receiptSnapshot = await getDocs(paymentCollection);
-          receiptSnapshot.docs.forEach((receiptSnap) => {
-            const receipt = receiptSnap.data() || {};
-            const receiptId = String(receipt.paymentId ?? receiptSnap.id);
-            if (seenReceiptIds.has(receiptId)) return;
-            seenReceiptIds.add(receiptId);
-            if (receipt.classId !== undefined && String(receipt.classId) !== selectedClassId) return;
-            if (receipt.month !== undefined && normalizeMonthKey(receipt.month) !== selectedMonthKey) return;
-            const studentIdRaw = receipt.studentId;
-            if (studentIdRaw === undefined || studentIdRaw === null) return;
-            const studentId = String(studentIdRaw);
-            if (!rosterIds.has(studentId)) return;
-            const amount = parseNonNegativeNumber(receipt.amount);
-            const paymentDate = normalizeDate(receipt.createdAt ?? receipt.paidAt ?? receipt.date);
-            if (amount === null || amount <= 0) {
-              if (amount === null) console.warn(`[Analytics] Ignored malformed payment receipt ${receiptSnap.id}.`);
-              return;
-            }
-            receiptTotalsByStudent[studentId] = (receiptTotalsByStudent[studentId] ?? 0) + amount;
-            if (paymentDate && (!lastReceiptDateByStudent[studentId] || paymentDate > lastReceiptDateByStudent[studentId])) {
-              lastReceiptDateByStudent[studentId] = paymentDate;
-            }
-            if (paymentDate === normalizedSelectedDate) {
-              dailyRevenue += amount;
-              dailyReceiptsByStudent[studentId] = (dailyReceiptsByStudent[studentId] ?? 0) + amount;
-              studentsPaidOnSelectedDate.add(studentId);
-            }
-          });
-        } catch (error: any) {
-          warnings.push(error?.code === 'permission-denied'
-            ? 'Daily payment receipts are unavailable because Firestore denied access.'
-            : 'Daily payment receipts could not be loaded. Daily revenue is shown only when receipts are readable.');
-          console.error(`[Analytics] Payment receipt read failed for ${targetFeeDocId}:`, error);
-        }
-
-        let paidStudentsCount = 0;
-        let monthTotalRevenue = 0;
-        const feeDetailList: FeeDetailStudent[] = [];
-        uniqueStudents.forEach((student) => {
-          const studentId = String(student.id);
-          const recordRaw = rawFeeRecords[studentId];
-          const record = isPlainObject(recordRaw) ? recordRaw : null;
-          if (recordRaw !== undefined && record === null) {
-            console.warn(`[Analytics] Ignored malformed fee record for student ${studentId}.`);
-          }
-          const recordPaidAmount = parseNonNegativeNumber(record?.paidAmount);
-          const receiptPaidAmount = receiptTotalsByStudent[studentId] ?? 0;
-          // Avoid double-counting records and receipts which represent the same cash receipts.
-          const amountPaid = Math.max(recordPaidAmount ?? 0, receiptPaidAmount);
-          monthTotalRevenue += amountPaid;
-
-          const feeDue = parseNonNegativeNumber(record?.monthlyFeeDue)
-            ?? parseNonNegativeNumber(student.studentFee)
-            ?? parseNonNegativeNumber(activeClass.monthlyFee)
-            ?? 0;
-          const previousDues = parseNonNegativeNumber(record?.previousMonthDues) ?? 0;
-          const obligation = feeDue + previousDues;
-          const remainingDues = parseNonNegativeNumber(record?.remainingDues);
-          const status = String(record?.status ?? '').trim().toUpperCase();
-          let isFullyPaid = false;
-          if (obligation > 0) {
-            if (status === 'PAID') {
-              isFullyPaid = remainingDues === null || remainingDues <= 0.005;
-            } else if (!status && recordPaidAmount !== null) {
-              isFullyPaid = remainingDues !== null
-                ? remainingDues <= 0.005 && recordPaidAmount >= obligation - 0.005
-                : recordPaidAmount >= obligation - 0.005;
-            }
-          }
-          if (isFullyPaid) paidStudentsCount++;
-
-          const paidDate = normalizeDate(record?.paidDate ?? record?.paidAt ?? record?.date)
-            || lastReceiptDateByStudent[studentId];
+        if (isFullyPaid) paidStudentsCount++;
+        const paidDate = normalizeDate(record?.paidDate) || normalizeDate(record?.paidAt) || normalizeDate(record?.date)
+          || monthlyReceiptSummary.lastDateByStudent[studentId];
+        if (monthlyPaymentsAvailable) {
           feeDetailList.push({
             id: studentId,
             name: String(student.name || `Student (${studentId.slice(-4)})`),
@@ -1456,88 +1921,103 @@ export default function AnalyticsPage() {
             amountPaid,
             ...(isFullyPaid && paidDate ? { date: paidDate } : {}),
           });
-        });
+        }
+      });
+    }
 
-        const activeCounts = activeAttendance.counts;
-        const calcAttendanceRate = percent(activeCounts.present + activeCounts.late, activeCounts.total);
-        const calculatedAbsentPercentage = percent(activeCounts.absent, activeCounts.total);
-        const recoveryRate = totalStudents > 0 ? Math.round((paidStudentsCount / totalStudents) * 100) : 0;
-        const pendingStudentsCount = Math.max(0, totalStudents - paidStudentsCount);
-        const dailyHasAttendance = dailyAttendance.counts.total > 0;
-        const dailyHasPayments = dailyRevenue > 0;
-
-        // The student capture metrics deliberately use the selected MONTH even when the report
-        // cards are toggled to Daily Analytics, so changing the date does not reshuffle captures.
-        const captureValues: Record<string, { attendanceRate: number | null; quizMarks: number | null; weightedScore: number | null; overallScore: number | null }> = {};
+    if (currentFeeSource.hasSnapshot && currentFeeSource.validData && monthlyPaymentsAvailable) {
+      if (feeRecordsUsable) {
         uniqueStudents.forEach((student) => {
-          const id = String(student.id);
-          const attendance = monthlyAttendance.byStudent[id];
-          const attendanceRate = attendance && attendance.total > 0
-            ? ((attendance.present + attendance.late) / attendance.total) * 100
-            : null;
-          const quizzes = quizTotals[id];
-          const quizMarks = quizzes?.averagePercent ?? null;
-          const roundedAttendanceRate = attendanceRate === null ? null : Math.round(attendanceRate * 100) / 100;
-          const roundedQuizMarks = quizMarks === null ? null : Math.round(quizMarks * 100) / 100;
-          const calculatedWeightedScore = calculateWeightedScore(roundedAttendanceRate, roundedQuizMarks);
-          const storedOverallScore = parseScoreOutOf100(student.overallScore);
-          captureValues[id] = {
-            attendanceRate: roundedAttendanceRate,
-            quizMarks: roundedQuizMarks,
-            // Weighted Score requires both source components; no missing component becomes zero.
-            // overallScore keeps the legacy saved value when available, then falls back to the same formula.
-            weightedScore: calculatedWeightedScore,
-            overallScore: storedOverallScore ?? calculatedWeightedScore,
-          };
+          const recordRaw = rawFeeRecords[String(student.id)];
+          const record = isPlainObject(recordRaw) ? recordRaw : null;
+          const recordPaidAmount = parseNonNegativeNumber(record?.paidAmount);
+          const receiptPaidAmount = monthlyReceiptSummary.totalsByStudent[String(student.id)] ?? 0;
+          monthTotalRevenue += Math.max(recordPaidAmount ?? 0, receiptPaidAmount);
         });
-
-        const notice = analyticsType === 'daily' && !dailyHasAttendance && !dailyHasPayments
-          ? `No attendance or payment receipts found for ${normalizedSelectedDate || selectedDate}. Daily revenue is not inferred from document update timestamps.`
-          : warnings[0] ?? null;
-
-        if (cancelled) return;
-        setTrendDataPoints(calculatedTrend);
-        setNoDataNotification(notice);
-        setFeeDetailedStudents(feeDetailList);
-        setMetrics({
-          attendanceRate: calcAttendanceRate,
-          absentPercentage: calculatedAbsentPercentage,
-          presentCount: activeCounts.present,
-          lateCount: activeCounts.late,
-          absentCount: activeCounts.absent,
-          absentToday: dailyAttendance.counts.absent,
-          feeRecoveryRate: recoveryRate,
-          paidCount: paidStudentsCount,
-          pendingCount: pendingStudentsCount,
-          totalRevenue: Math.round(monthTotalRevenue * 100) / 100,
-          dailyCollectedRevenue: Math.round(dailyRevenue * 100) / 100,
-          dailyPaidCount: studentsPaidOnSelectedDate.size,
-          totalStudentsCount: totalStudents,
-        });
-        setCaptureMetricSnapshot({ contextKey: captureContextKey, values: captureValues });
-      } catch (error: any) {
-        if (cancelled) return;
-        console.error('[Analytics] Failed to calculate analytics:', error);
-        setFeeDetailedStudents([]);
-        setCaptureMetricSnapshot(null);
-        setMetrics({ ...EMPTY_METRICS });
-        setTrendDataPoints([0, 0, 0, 0, 0, 0, 0]);
-        const message = error?.code === 'permission-denied'
-          ? 'Access denied while loading analytics. Check Firestore Security Rules for this teacher workspace.'
-          : error?.code === 'unauthenticated'
-          ? 'Your session expired. Please sign in again.'
-          : error?.code === 'unavailable' || error?.code === 'deadline-exceeded'
-          ? 'Network problem while loading analytics. Please check your connection.'
-          : String(error?.message || 'Could not calculate analytics.');
-        setNoDataNotification(message);
-      } finally {
-        if (!cancelled) setFetchingMetrics(false);
+      } else {
+        // Receipts remain independently valid even when the aggregate feeRecords map is malformed.
+        monthTotalRevenue = Object.values(monthlyReceiptSummary.totalsByStudent).reduce<number>((sum, value) => sum + Number(value), 0);
       }
-    };
+    }
 
-    calculateAnalytics();
-    return () => { cancelled = true; };
-  }, [selectedClassId, selectedMonthKey, selectedDate, analyticsType, classesList, userEmail]);
+    const monthlyFeeMetricsAvailable = currentFeeSource.hasSnapshot && currentFeeSource.validData && feeRecordsUsable;
+    const attendanceMetricsAvailable = attendanceCompleteEnoughToEvaluate && attendanceHasRecordedStudents;
+    const dailyAttendanceAvailable = analyticsType === 'daily' && attendanceCompleteEnoughToEvaluate && dailyAttendance.counts.total > 0;
+    const recoveryRate = totalStudents > 0 ? Math.round((paidStudentsCount / totalStudents) * 100) : 0;
+    const pendingStudentsCount = Math.max(0, totalStudents - paidStudentsCount);
+
+    const captureValues: Record<string, { attendanceRate: number | null; quizMarks: number | null; weightedScore: number | null; overallScore: number | null }> = {};
+    uniqueStudents.forEach((student) => {
+      const id = String(student.id);
+      const attendance = attendanceCompleteEnoughToEvaluate ? monthlyAttendance.byStudent[id] : undefined;
+      const attendanceRate = attendance && attendance.total > 0
+        ? ((attendance.present + attendance.late) / attendance.total) * 100
+        : null;
+      const quizzes = currentQuizSource.hasSnapshot ? quizTotals[id] : undefined;
+      const quizMarks = quizzes?.averagePercent ?? null;
+      const roundedAttendanceRate = attendanceRate === null ? null : Math.round(attendanceRate * 100) / 100;
+      const roundedQuizMarks = quizMarks === null ? null : Math.round(quizMarks * 100) / 100;
+      const calculatedWeightedScore = calculateWeightedScore(roundedAttendanceRate, roundedQuizMarks);
+      const storedOverallScore = parseScoreOutOf100(student.overallScore);
+      captureValues[id] = {
+        attendanceRate: roundedAttendanceRate,
+        quizMarks: roundedQuizMarks,
+        weightedScore: calculatedWeightedScore,
+        overallScore: storedOverallScore ?? calculatedWeightedScore,
+      };
+    });
+
+    const visibleWarnings = [
+      ...(attendanceCompleteEnoughToEvaluate ? attendanceWarnings : []),
+      ...(currentQuizSource.hasSnapshot ? quizWarnings : []),
+      ...feeWarnings,
+      ...(monthlyPaymentsAvailable ? monthlyReceiptSummary.warnings : []),
+      ...(dailyPaymentsAvailable ? dailyReceiptSummary.warnings : []),
+    ];
+    const noDailyRecords = analyticsType === 'daily' && Boolean(normalizedSelectedDate) &&
+      attendanceCompleteEnoughToEvaluate && dailyPaymentsAvailable &&
+      !dailyAttendanceAvailable && dailyReceiptSummary.exactDayRevenue <= 0;
+
+    if (cancelled) return;
+    setTrendDataPoints(attendanceCompleteEnoughToEvaluate ? calculatedTrend : [0, 0, 0, 0, 0, 0, 0]);
+    setFeeDetailedStudents(monthlyPaymentsAvailable && monthlyFeeMetricsAvailable ? feeDetailList : []);
+    setMetrics({
+      attendanceRate: attendanceMetricsAvailable
+        ? percent(activeAttendance.counts.present + activeAttendance.counts.late, activeAttendance.counts.total)
+        : null,
+      absentPercentage: attendanceMetricsAvailable ? percent(activeAttendance.counts.absent, activeAttendance.counts.total) : null,
+      presentCount: attendanceMetricsAvailable ? activeAttendance.counts.present : null,
+      lateCount: attendanceMetricsAvailable ? activeAttendance.counts.late : null,
+      absentCount: attendanceMetricsAvailable ? activeAttendance.counts.absent : null,
+      absentToday: dailyAttendanceAvailable ? dailyAttendance.counts.absent : null,
+      feeRecoveryRate: monthlyFeeMetricsAvailable ? recoveryRate : null,
+      paidCount: monthlyFeeMetricsAvailable ? paidStudentsCount : null,
+      pendingCount: monthlyFeeMetricsAvailable ? pendingStudentsCount : null,
+      totalRevenue: currentFeeSource.hasSnapshot && currentFeeSource.validData && monthlyPaymentsAvailable
+        ? Math.round(monthTotalRevenue * 100) / 100
+        : null,
+      dailyCollectedRevenue: dailyPaymentsAvailable ? Math.round(dailyReceiptSummary.exactDayRevenue * 100) / 100 : null,
+      dailyPaidCount: dailyPaymentsAvailable ? dailyReceiptSummary.studentsPaidExactDay.size : null,
+      totalStudentsCount: classesSource.scopeKey === userEmail && classesSource.hasSnapshot ? totalStudents : null,
+    });
+    setMetricsContextKey(analyticsContextKey);
+    setCaptureMetricSnapshot({ contextKey: captureContextKey, values: captureValues });
+    if (visibleWarnings.length > 0) {
+      setNoDataNotification(visibleWarnings[0]);
+    } else if (noDailyRecords) {
+      setNoDataNotification(`No recorded attendance or payment receipts found for ${normalizedSelectedDate}. Daily collection is calculated only from dated receipts.`);
+    } else {
+      setNoDataNotification(null);
+    }
+  }, [
+    userEmail, selectedClassId, selectedMonthKey, selectedDate, selectedDateMonth, normalizedSelectedDate, baseScopeKey, dailySourceScopeKey,
+    analyticsType, needsCrossMonthDailySources, analyticsContextKey, classesList, classesSource.hasSnapshot, classesSource.scopeKey,
+    attendanceAnalysis, quizAnalysis, currentFeeSource, currentMonthlyPaymentsSource,
+    currentDailyPaymentsSource, monthlyReceiptSummary, dailyReceiptSummary, monthlyPaymentsAvailable, dailyPaymentsAvailable, dailyPaymentSourceForMetrics,
+    classesSource.hasSnapshot, classesSource.scopeKey,
+  ]);
+
+  const shownMetrics = metricsContextKey === analyticsContextKey ? metrics : EMPTY_METRICS;
 
   const filteredFeeStudents = useMemo(() => {
     if (feeModalFilter === 'PAID') return feeDetailedStudents.filter((s) => s.status === 'PAID');
@@ -1656,7 +2136,7 @@ export default function AnalyticsPage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-[#070b13] flex items-center justify-center text-slate-300">
+      <div className="min-h-screen bg-[#f8fafc] flex items-center justify-center text-slate-600">
         <div className="flex flex-col items-center gap-3">
           <Loader2 className="h-9 w-9 animate-spin text-orange-500" />
           <p className="text-xs font-black tracking-wide text-orange-400">
@@ -1736,7 +2216,11 @@ export default function AnalyticsPage() {
             <span className="text-[11px] font-black uppercase tracking-wider text-slate-400 dark:text-slate-300 flex items-center gap-1.5">
               <CheckCircle2 className="h-4 w-4 text-orange-500" /> ACTIVE DATA SELECTION
             </span>
-            {fetchingMetrics ? (
+            {sourceErrorNotification ? (
+              <span className="flex items-center gap-1 text-[10px] font-bold text-amber-600" title={sourceErrorNotification}>
+                <AlertCircle className="h-3 w-3" /> Sync issue
+              </span>
+            ) : fetchingMetrics || !isLiveConnected ? (
               <span className="flex items-center gap-1 text-[10px] font-bold text-orange-500 animate-pulse">
                 <Loader2 className="h-3 w-3 animate-spin" /> Syncing...
               </span>
@@ -1822,17 +2306,27 @@ export default function AnalyticsPage() {
                     />
                   </div>
 
-                  {noDataNotification && (
-                    <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center gap-2.5 text-amber-500 animate-in fade-in duration-300">
-                      <AlertCircle className="h-4 w-4 shrink-0 animate-pulse" />
-                      <p className="text-[11px] font-bold leading-tight">
-                        {noDataNotification}
-                      </p>
-                    </div>
-                  )}
+
                 </div>
               )}
             </div>
+            {(sourceErrorNotification || noDataNotification) && (
+              <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/30 flex items-center gap-2.5 text-amber-600 animate-in fade-in duration-300">
+                <AlertCircle className="h-4 w-4 shrink-0" />
+                <p className="text-[11px] font-bold leading-tight flex-1">
+                  {sourceErrorNotification || noDataNotification}
+                </p>
+                {canRetrySync && (
+                  <button
+                    type="button"
+                    onClick={() => setRetryNonce((value) => value + 1)}
+                    className="shrink-0 rounded-lg border border-amber-500/40 px-2 py-1 text-[10px] font-black hover:bg-amber-500/10"
+                  >
+                    Retry
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
@@ -1853,7 +2347,7 @@ export default function AnalyticsPage() {
             <div>
               <p className="text-[11px] font-bold text-slate-400">Attendance Rate</p>
               <h2 className="text-2xl font-black text-emerald-500">
-                {metrics.attendanceRate}%
+                {shownMetrics.attendanceRate === null ? '—' : `${shownMetrics.attendanceRate}%`}
               </h2>
             </div>
           </div>
@@ -1880,19 +2374,19 @@ export default function AnalyticsPage() {
               {analyticsType === 'month' ? (
                 <div className="flex items-baseline gap-1.5">
                   <h2 className="text-2xl font-black text-orange-500">
-                    {metrics.feeRecoveryRate}%
+                    {shownMetrics.feeRecoveryRate === null ? '—' : `${shownMetrics.feeRecoveryRate}%`}
                   </h2>
                   <span className="text-[10px] font-extrabold text-slate-400">
-                    ({metrics.paidCount}/{metrics.totalStudentsCount})
+                    ({shownMetrics.paidCount === null ? '—' : shownMetrics.paidCount}/{shownMetrics.totalStudentsCount === null ? '—' : shownMetrics.totalStudentsCount})
                   </span>
                 </div>
               ) : (
                 <div className="space-y-0.5">
                   <h2 className="text-lg font-black text-orange-500">
-                    PKR {metrics.dailyCollectedRevenue.toLocaleString()}
+                    PKR {shownMetrics.dailyCollectedRevenue === null ? '—' : shownMetrics.dailyCollectedRevenue.toLocaleString()}
                   </h2>
                   <p className="text-[10px] font-extrabold text-emerald-500">
-                    {metrics.dailyPaidCount} Paid Today
+                    {shownMetrics.dailyPaidCount === null ? '—' : shownMetrics.dailyPaidCount} Paid Today
                   </p>
                 </div>
               )}
@@ -1910,7 +2404,7 @@ export default function AnalyticsPage() {
             <div>
               <p className="text-[11px] font-bold text-slate-400">Enrolled Students</p>
               <h2 className="text-2xl font-black text-blue-500">
-                {metrics.totalStudentsCount}
+                {shownMetrics.totalStudentsCount === null ? '—' : shownMetrics.totalStudentsCount}
               </h2>
             </div>
           </div>
@@ -1929,10 +2423,10 @@ export default function AnalyticsPage() {
               </p>
               <div className="flex items-center gap-2">
                 <h2 className="text-2xl font-black text-rose-500">
-                  {analyticsType === 'daily' ? metrics.absentToday : metrics.absentCount}
+                  {(analyticsType === 'daily' ? shownMetrics.absentToday : shownMetrics.absentCount) === null ? '—' : (analyticsType === 'daily' ? shownMetrics.absentToday : shownMetrics.absentCount)}
                 </h2>
                 <span className="text-xs font-extrabold px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-500 border border-rose-500/20">
-                  ({metrics.absentPercentage}%)
+                  ({shownMetrics.absentPercentage === null ? '—' : `${shownMetrics.absentPercentage}%`})
                 </span>
               </div>
             </div>
@@ -2013,7 +2507,7 @@ export default function AnalyticsPage() {
                   />
                   <path
                     className="text-emerald-500"
-                    strokeDasharray={`${metrics.attendanceRate}, 100`}
+                    strokeDasharray={`${shownMetrics.attendanceRate ?? 0}, 100`}
                     strokeWidth="3.8"
                     strokeLinecap="round"
                     stroke="currentColor"
@@ -2023,7 +2517,7 @@ export default function AnalyticsPage() {
                 </svg>
                 <div className="absolute text-center">
                   <p className="text-base font-black text-slate-900 dark:text-slate-100">
-                    {metrics.attendanceRate}%
+                    {shownMetrics.attendanceRate === null ? '—' : `${shownMetrics.attendanceRate}%`}
                   </p>
                   <p className="text-[9px] font-bold text-slate-400">Present</p>
                 </div>
@@ -2033,17 +2527,17 @@ export default function AnalyticsPage() {
                 <div className="flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full bg-emerald-500" />
                   <span className="text-slate-500 dark:text-slate-400 font-extrabold">Present</span>
-                  <span className="ml-auto font-black">{metrics.presentCount}</span>
+                  <span className="ml-auto font-black">{shownMetrics.presentCount === null ? '—' : shownMetrics.presentCount}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full bg-orange-400" />
                   <span className="text-slate-500 dark:text-slate-400 font-extrabold">Late</span>
-                  <span className="ml-auto font-black">{metrics.lateCount}</span>
+                  <span className="ml-auto font-black">{shownMetrics.lateCount === null ? '—' : shownMetrics.lateCount}</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="h-2.5 w-2.5 rounded-full bg-rose-500" />
                   <span className="text-slate-500 dark:text-slate-400 font-extrabold">Absent</span>
-                  <span className="ml-auto font-black">{metrics.absentCount}</span>
+                  <span className="ml-auto font-black">{shownMetrics.absentCount === null ? '—' : shownMetrics.absentCount}</span>
                 </div>
               </div>
             </div>
@@ -2053,30 +2547,30 @@ export default function AnalyticsPage() {
             <div className="flex items-center justify-between">
               <h3 className="text-xs font-black">Fee Collection Summary</h3>
               <span className="text-xs font-black text-orange-500">
-                {metrics.feeRecoveryRate}%
+                {shownMetrics.feeRecoveryRate === null ? '—' : `${shownMetrics.feeRecoveryRate}%`}
               </span>
             </div>
 
             <div className="w-full bg-slate-100 dark:bg-slate-900 h-3.5 rounded-full overflow-hidden p-0.5">
               <div
                 className="bg-gradient-to-r from-orange-500 to-amber-500 h-full rounded-full transition-all duration-500 shadow-sm"
-                style={{ width: `${metrics.feeRecoveryRate}%` }}
+                style={{ width: `${shownMetrics.feeRecoveryRate ?? 0}%` }}
               />
             </div>
 
             <div className="grid grid-cols-3 gap-2 text-center pt-1">
               <div className="bg-slate-50 dark:bg-[#070b13] p-2 rounded-2xl border border-slate-100 dark:border-slate-800">
                 <p className="text-[9px] font-bold text-slate-400">Paid Students</p>
-                <p className="text-xs font-black text-emerald-500">{metrics.paidCount}</p>
+                <p className="text-xs font-black text-emerald-500">{shownMetrics.paidCount === null ? '—' : shownMetrics.paidCount}</p>
               </div>
               <div className="bg-slate-50 dark:bg-[#070b13] p-2 rounded-2xl border border-slate-100 dark:border-slate-800">
                 <p className="text-[9px] font-bold text-slate-400">Pending</p>
-                <p className="text-xs font-black text-orange-500">{metrics.pendingCount}</p>
+                <p className="text-xs font-black text-orange-500">{shownMetrics.pendingCount === null ? '—' : shownMetrics.pendingCount}</p>
               </div>
               <div className="bg-slate-50 dark:bg-[#070b13] p-2 rounded-2xl border border-slate-100 dark:border-slate-800">
                 <p className="text-[9px] font-bold text-slate-400">Month Revenue</p>
                 <p className="text-[11px] font-black text-slate-800 dark:text-slate-200">
-                  PKR {metrics.totalRevenue.toLocaleString()}
+                  PKR {shownMetrics.totalRevenue === null ? '—' : shownMetrics.totalRevenue.toLocaleString()}
                 </p>
               </div>
             </div>
